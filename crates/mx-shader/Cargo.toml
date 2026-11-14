@@ -1,0 +1,20 @@
+[package]
+name = "mx-shader"
+description = "mX: WGSL through naga to each backend's shading language, with the bindless heap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+msl = ["naga/msl-out"]
+spirv = ["naga/spv-out"]
+hlsl = ["naga/hlsl-out"]
+
+[dependencies]
+naga.workspace = true
+naga-types.workspace = true
+thiserror.workspace = true

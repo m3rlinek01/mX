@@ -1,0 +1,36 @@
+[package]
+name = "mx"
+description = "mX: openOMSI's bindless graphics library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+categories.workspace = true
+keywords.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+mx-types.workspace = true
+mx-shader.workspace = true
+
+# (optional everywhere: the `vulkan` feature picks it on any platform, macOS via MoltenVK)
+mx-vulkan = { workspace = true, optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+mx-metal.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+mx-dx12.workspace = true
+
+[target.'cfg(not(any(target_vendor = "apple", windows)))'.dependencies]
+mx-vulkan.workspace = true
+
+[features]
+# Vulkan as the backend on every platform (on Apple platforms through MoltenVK).
+vulkan = ["dep:mx-vulkan"]
+
+[dev-dependencies]
+bytemuck.workspace = true
+winit = "0.30"
+png = "0.17"
+pollster = "0.4"

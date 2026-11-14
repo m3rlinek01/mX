@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/mx-types", "crates/mx-shader", "crates/mx-metal", "crates/mx-vulkan", "crates/mx-dx12", "crates/mx", "crates/mx-parity", "crates/wgpu-mx"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "AGPL-3.0-only"
+repository = "https://github.com/openOMSI-org/mX"
+keywords = ["graphics", "gpu", "bindless", "metal", "vulkan"]
+categories = ["graphics", "rendering::graphics-api"]
+
+[workspace.dependencies]
+mx-types = { path = "crates/mx-types" }
+mx-shader = { path = "crates/mx-shader" }
+mx-metal = { path = "crates/mx-metal" }
+mx-vulkan = { path = "crates/mx-vulkan" }
+mx-dx12 = { path = "crates/mx-dx12" }
+bitflags = "2"
+thiserror = "2"
+log = "0.4"
+parking_lot = "0.12"
+naga = { version = "30", features = ["wgsl-in"] }
+# (naga's own vertex format type, which naga does not re-export: same version as naga)
+naga-types = "30"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3.2"
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.dev]
+opt-level = 1

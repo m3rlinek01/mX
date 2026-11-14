@@ -1,0 +1,16 @@
+name: Feature request
+description: Something mX should do that it does not
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What do you need
+      description: The use, not the solution. What would you draw or compute with it?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How it could look
+      description: An API sketch, or how wgpu / Metal / Vulkan / D3D12 expose it.

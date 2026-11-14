@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: openOMSI
+    url: https://github.com/openOMSI-org/openOMSI/issues
+    about: Problems in the game itself go to openOMSI's issues.

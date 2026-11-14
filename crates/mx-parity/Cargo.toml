@@ -1,0 +1,26 @@
+[package]
+name = "mx-parity"
+description = "Pixel parity tests: the same scenes drawn by wgpu (openOMSI's revision) and by mX"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[dev-dependencies]
+mx = { path = "../mx" }
+bytemuck.workspace = true
+pollster = "0.4"
+naga.workspace = true
+# exactly the wgpu openOMSI ships (upstream v29.0.4 plus the org's fixes)
+wgpu = { git = "https://github.com/openOMSI-Project/wgpu-openomsi", rev = "4eb06e5bf8062be2978d93e95556a4dd83f1d3b8", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
+
+[features]
+# Compare on Vulkan: wgpu's Vulkan backend against mX's (macOS: both through MoltenVK; run with
+# DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib so wgpu finds the Vulkan loader).
+vulkan = ["mx/vulkan", "wgpu/vulkan", "wgpu/vulkan-portability"]
+# Compare on Direct3D 12 (Windows): wgpu's D3D12 backend against mX's (mX's default there).
+dx12 = ["wgpu/dx12"]

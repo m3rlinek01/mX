@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  linux:
+    name: Linux (Vulkan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Vulkan (Mesa lavapipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1 vulkan-validationlayers
+      - name: Clippy
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p wgpu-mx --features custom --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test -p mx-types -p mx-shader --all-features
+      - name: Conformance tests on lavapipe
+        run: cargo test -p mx --test conformance -- --test-threads=1
+      - name: Conformance tests under the validation layer
+        env:
+          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+          VK_KHRONOS_VALIDATION_VALIDATE_SYNC: "true"
+        run: |
+          set -o pipefail
+          cargo test -p mx --test conformance -- --test-threads=1 2>&1 | tee validation.log
+          ! grep -q "mX Vulkan validation error" validation.log
+      - name: wgpu-mx through wgpu's API, and as a wgpu backend
+        run: cargo test -p wgpu-mx --features custom
+      - name: Android (Vulkan) compiles
+        run: |
+          rustup target add aarch64-linux-android
+          cargo check -p wgpu-mx --features custom --target aarch64-linux-android
+
+  macos:
+    # (the virtual GPU of GitHub's macOS runners lacks what mX needs, so the tests on Metal
+    # run on real Macs; here the Metal backend is built and linted)
+    name: macOS (Metal, build)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p wgpu-mx --features custom --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test -p mx-types -p mx-shader --all-features
+      - name: iOS (Metal) compiles
+        run: |
+          rustup target add aarch64-apple-ios
+          cargo check -p wgpu-mx --features custom --target aarch64-apple-ios
+
+  windows:
+    name: Windows (Direct3D 12)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: |
+          cargo clippy -p mx-dx12 -p mx -p wgpu-mx --all-targets -- -D warnings
+          cargo clippy -p wgpu-mx --features custom --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test -p mx-types -p mx-shader --all-features
+      - name: Conformance tests on WARP
+        run: cargo test -p mx --test conformance -- --test-threads=1
+      - name: wgpu-mx through wgpu's API, and as a wgpu backend
+        run: cargo test -p wgpu-mx --features custom -- --test-threads=1

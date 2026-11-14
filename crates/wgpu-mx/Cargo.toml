@@ -1,0 +1,33 @@
+[package]
+name = "wgpu-mx"
+description = "wgpu's API (version 29) on mX: lets code written for wgpu, openOMSI's renderer first, run on mX unchanged"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+mx = { path = "../mx" }
+mx-types.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+raw-window-handle = "0.6"
+# wgpu's own plain data types and its naga, at the revision openOMSI ships, so the types are
+# the ones openOMSI's code (and its direct naga use) expects
+wgpu-types = { git = "https://github.com/openOMSI-Project/wgpu-openomsi", rev = "4eb06e5bf8062be2978d93e95556a4dd83f1d3b8" }
+naga = { package = "naga", version = "29", features = ["wgsl-in"] }
+# wgpu itself, for `custom`: mX as one of wgpu's backends, chosen at run time
+wgpu = { git = "https://github.com/openOMSI-Project/wgpu-openomsi", rev = "4eb06e5bf8062be2978d93e95556a4dd83f1d3b8", default-features = false, features = ["std", "custom", "wgsl", "parking_lot"], optional = true }
+
+[features]
+# `wgpu_mx::custom`: mX behind a real `wgpu::Instance` (wgpu's custom backends)
+custom = ["dep:wgpu"]
+# (wgpu's ANGLE backend: accepted so that manifests asking for it resolve; mX has no GL)
+angle = []
+
+[[test]]
+name = "custom_backend"
+required-features = ["custom"]

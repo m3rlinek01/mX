@@ -1,0 +1,30 @@
+[package]
+name = "mx-vulkan"
+description = "mX: the Vulkan backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+mx-types.workspace = true
+mx-shader = { workspace = true, features = ["spirv"] }
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
+parking_lot.workspace = true
+thiserror.workspace = true
+log.workspace = true
+raw-window-handle = "0.6"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2.workspace = true
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "CALayer", "CAMetalLayer"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-quartz-core", "objc2-core-foundation", "NSView", "NSWindow", "NSResponder", "NSGraphics"] }
+
+[target.'cfg(all(target_vendor = "apple", not(target_os = "macos")))'.dependencies]
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "objc2-quartz-core", "UIView", "UIResponder"] }

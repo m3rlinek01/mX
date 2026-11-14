@@ -1,0 +1,43 @@
+name: Bug report
+description: Something renders wrong, crashes or fails validation
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you see, and what you expected instead. Screenshots help for anything visual.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The smallest program, test or openOMSI scene that shows it.
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - Metal
+        - Vulkan
+        - Vulkan (MoltenVK)
+        - Direct3D 12
+        - wgpu-mx (through wgpu's API)
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System and GPU
+      placeholder: macOS 15.4, Apple M4 / Windows 11, RTX 4070, driver 572.16
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Validation output or log
+      description: Run with MTL_DEBUG_LAYER=1 (Metal) or VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation (Vulkan) and paste what it reports.
+      render: text
