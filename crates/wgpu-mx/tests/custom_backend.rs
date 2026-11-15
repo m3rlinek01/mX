@@ -226,6 +226,34 @@ fn render_with_bind_groups_and_dynamic_offsets() {
     }
 }
 
+/// What mX cannot create is reported as wgpu reports it, so the caller can fall back: an
+/// error in the error scope for a resource, an `Err` for a device.
+#[test]
+fn failures_are_errors_not_panics() {
+    let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let (device, _queue) = open();
+    let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let _huge = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("64 TiB"),
+        size: 1 << 46,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let err = now(scope.pop());
+    assert!(matches!(err, Some(wgpu::Error::OutOfMemory { .. })), "{err:?}");
+
+    let adapter = now(wgpu_mx::custom::instance().request_adapter(&Default::default())).unwrap();
+    let missing = wgpu::Features::all() - adapter.features();
+    assert!(!missing.is_empty());
+    assert!(
+        now(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: missing,
+            ..Default::default()
+        }))
+        .is_err()
+    );
+}
+
 /// A compute pass, a buffer mapped at creation, and a shader error caught by an error scope.
 #[test]
 fn compute_mapping_and_error_scopes() {

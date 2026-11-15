@@ -37,12 +37,12 @@ pub fn queue(q: &wgpu::Queue) -> Option<&mx::Queue> {
 
 /// The mX texture under a wgpu texture made on an mX device.
 pub fn texture(t: &wgpu::Texture) -> Option<&mx::Texture> {
-    t.as_custom::<MxTexture>().map(|t| &t.0)
+    t.as_custom::<MxTexture>().and_then(|t| t.0.as_ref())
 }
 
 /// The mX buffer under a wgpu buffer made on an mX device.
 pub fn buffer(b: &wgpu::Buffer) -> Option<&mx::Buffer> {
-    b.as_custom::<MxBuffer>().map(|b| &b.0.mx)
+    b.as_custom::<MxBuffer>().and_then(|b| b.0.raw.as_ref())
 }
 
 /// Whether a wgpu device runs on mX.
@@ -229,17 +229,23 @@ fn limits(l: &mx::Limits) -> wgpu::Limits {
 
 impl AdapterInterface for MxAdapter {
     fn request_device(&self, desc: &wgpu::DeviceDescriptor<'_>) -> Pin<Box<dyn RequestDeviceFuture>> {
+        use wgpu::wgc::{device::DeviceError, instance::RequestDeviceError};
         let missing = desc.required_features - self.mx_features();
         if !missing.is_empty() {
-            log::error!("mX: the device asks for features mX does not have: {missing:?}");
+            return Box::pin(std::future::ready(Err(RequestDeviceError::UnsupportedFeature(missing).into())));
         }
-        let (d, q) = self
-            .0
-            .request_device(&mx::DeviceDescriptor {
-                label: desc.label,
-                ..Default::default()
-            })
-            .unwrap_or_else(|e| panic!("mX: requesting a device: {e}"));
+        let (d, q) = match self.0.request_device(&mx::DeviceDescriptor {
+            label: desc.label,
+            ..Default::default()
+        }) {
+            Ok(dq) => dq,
+            Err(e) => {
+                // wgpu's error has no room for mX's reason, so the log keeps it
+                log::error!("mX: requesting a device: {e}");
+                let kind = if matches!(e, mx::Error::OutOfMemory(_)) { DeviceError::OutOfMemory } else { DeviceError::Lost };
+                return Box::pin(std::future::ready(Err(RequestDeviceError::Device(kind).into())));
+            }
+        };
         let inner = Arc::new(DeviceInner {
             mx: d,
             queue: q,
@@ -324,6 +330,24 @@ impl std::fmt::Display for Message {
     }
 }
 impl std::error::Error for Message {}
+
+/// wgpu's error for a failed mX call: out of memory when mX ran out of it, else a validation
+/// error, which is how wgpu reports what a device cannot create.
+fn mx_error(what: &str, e: mx::Error) -> wgpu::Error {
+    let description = format!("{what}: {e}");
+    match e {
+        mx::Error::OutOfMemory(_) | mx::Error::HeapFull(_) => wgpu::Error::OutOfMemory {
+            source: Box::new(Message(description)),
+        },
+        _ => validation(description),
+    }
+}
+
+/// An object whose creation failed is invalid, as in wgpu: the error went to the device's
+/// error scopes, and using the object anyway stops here.
+fn invalid(what: &str) -> ! {
+    panic!("mX: a {what} that failed to create was used (its error went to the error scope)")
+}
 
 fn validation(description: String) -> wgpu::Error {
     wgpu::Error::Validation {
@@ -441,7 +465,7 @@ impl DeviceInterface for MxDevice {
                 let r = match &e.resource {
                     wgpu::BindingResource::Buffer(b) => Owned::Buffer(cast(b.buffer.as_custom::<MxBuffer>(), "buffer").0.clone(), b.offset, b.size.map(|s| s.get())),
                     wgpu::BindingResource::TextureView(v) => Owned::View(cast(v.as_custom::<MxTextureView>(), "texture view").0.clone()),
-                    wgpu::BindingResource::Sampler(s) => Owned::Sampler(cast(s.as_custom::<MxSampler>(), "sampler").0.clone()),
+                    wgpu::BindingResource::Sampler(s) => Owned::Sampler(cast(s.as_custom::<MxSampler>(), "sampler").raw().clone()),
                     _ => panic!("mX: binding arrays and acceleration structures are not offered (textures are reached through the heap)"),
                 };
                 (e.binding, r)
@@ -508,14 +532,15 @@ impl DeviceInterface for MxDevice {
                 size: desc.size,
                 usage: conv::buffer_usages(desc.usage),
             })
-            .unwrap_or_else(|e| panic!("mX: {e}"));
+            .map_err(|e| self.0.error(mx_error(desc.label.unwrap_or("buffer"), e)))
+            .ok();
         let mappable = desc.usage.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE);
         let map = MapState {
             mapped: desc.mapped_at_creation,
             staging: (desc.mapped_at_creation && !mappable).then(|| vec![0u8; desc.size as usize]),
         };
         DispatchBuffer::custom(MxBuffer(Arc::new(BufferInner {
-            mx: b,
+            raw: b,
             size: desc.size,
             usage: desc.usage,
             map: Mutex::new(map),
@@ -538,7 +563,8 @@ impl DeviceInterface for MxDevice {
                 usage: conv::texture_usages(desc.usage),
                 view_formats: &view_formats,
             })
-            .unwrap_or_else(|e| panic!("mX: {e}"));
+            .map_err(|e| self.0.error(mx_error(desc.label.unwrap_or("texture"), e)))
+            .ok();
         DispatchTexture::custom(MxTexture(t))
     }
 
@@ -555,7 +581,12 @@ impl DeviceInterface for MxDevice {
     }
 
     fn create_sampler(&self, desc: &wgpu::SamplerDescriptor<'_>) -> DispatchSampler {
-        let s = self.0.mx.create_sampler(&conv::sampler(desc)).unwrap_or_else(|e| panic!("mX: {e}"));
+        let s = self
+            .0
+            .mx
+            .create_sampler(&conv::sampler(desc))
+            .map_err(|e| self.0.error(mx_error(desc.label.unwrap_or("sampler"), e)))
+            .ok();
         DispatchSampler::custom(MxSampler(s))
     }
 
@@ -568,8 +599,9 @@ impl DeviceInterface for MxDevice {
                 ty: conv::query_type(desc.ty),
                 count: desc.count,
             })
-            .unwrap_or_else(|e| panic!("mX: {e}"));
-        DispatchQuerySet::custom(MxQuerySet(Arc::new(q)))
+            .map_err(|e| self.0.error(mx_error(desc.label.unwrap_or("query set"), e)))
+            .ok();
+        DispatchQuerySet::custom(MxQuerySet(q.map(Arc::new)))
     }
 
     fn create_command_encoder(&self, desc: &wgpu::CommandEncoderDescriptor<'_>) -> DispatchCommandEncoder {
@@ -705,7 +737,7 @@ impl MxDevice {
 impl QueueInterface for MxQueue {
     fn write_buffer(&self, buffer: &DispatchBuffer, offset: wgpu::BufferAddress, data: &[u8]) {
         let b = cast(buffer.as_custom::<MxBuffer>(), "buffer");
-        if let Err(e) = self.0.queue.write_buffer(&b.0.mx, offset, data) {
+        if let Err(e) = self.0.queue.write_buffer(b.0.mx(), offset, data) {
             self.0.error(wgpu::Error::OutOfMemory {
                 source: Box::new(Message(e.to_string())),
             });
@@ -728,7 +760,7 @@ impl QueueInterface for MxQueue {
     fn write_texture(&self, texture: wgpu::TexelCopyTextureInfo<'_>, data: &[u8], data_layout: wgpu::TexelCopyBufferLayout, size: wgpu::Extent3d) {
         let t = cast(texture.texture.as_custom::<MxTexture>(), "texture");
         let dst = mx::TexelCopyTextureInfo {
-            texture: &t.0,
+            texture: t.raw(),
             mip_level: texture.mip_level,
             origin: conv::origin(texture.origin),
             aspect: conv::aspect(texture.aspect),
@@ -823,7 +855,7 @@ impl BindGroupInner {
                     Owned::Buffer(b, offset, size) => {
                         let extra = self.dynamic.iter().position(|d| d == binding).map_or(0, |i| offsets[i] as u64);
                         mx::BindingResource::Buffer(mx::BufferBinding {
-                            buffer: &b.mx,
+                            buffer: b.mx(),
                             offset: offset + extra,
                             size: *size,
                         })
@@ -857,11 +889,21 @@ impl BindGroupInterface for MxBindGroup {}
 struct MxTextureView(mx::TextureView);
 impl TextureViewInterface for MxTextureView {}
 
-struct MxSampler(mx::Sampler);
+struct MxSampler(Option<mx::Sampler>);
 impl SamplerInterface for MxSampler {}
+impl MxSampler {
+    fn raw(&self) -> &mx::Sampler {
+        self.0.as_ref().unwrap_or_else(|| invalid("sampler"))
+    }
+}
 
-struct MxQuerySet(Arc<mx::QuerySet>);
+struct MxQuerySet(Option<Arc<mx::QuerySet>>);
 impl QuerySetInterface for MxQuerySet {}
+impl MxQuerySet {
+    fn raw(&self) -> &Arc<mx::QuerySet> {
+        self.0.as_ref().unwrap_or_else(|| invalid("query set"))
+    }
+}
 
 struct MapState {
     mapped: bool,
@@ -870,7 +912,7 @@ struct MapState {
 }
 
 struct BufferInner {
-    mx: mx::Buffer,
+    raw: Option<mx::Buffer>,
     size: u64,
     usage: wgpu::BufferUsages,
     map: Mutex<MapState>,
@@ -878,6 +920,12 @@ struct BufferInner {
 }
 
 struct MxBuffer(Arc<BufferInner>);
+
+impl BufferInner {
+    fn mx(&self) -> &mx::Buffer {
+        self.raw.as_ref().unwrap_or_else(|| invalid("buffer"))
+    }
+}
 
 impl BufferInterface for MxBuffer {
     fn map_async(&self, mode: wgpu::MapMode, _range: Range<wgpu::BufferAddress>, callback: BufferMapCallback) {
@@ -905,7 +953,7 @@ impl BufferInterface for MxBuffer {
         let base = match &mut m.staging {
             Some(v) => NonNull::new(v.as_mut_ptr()).unwrap(),
             // SAFETY: the buffer is mapped, so no submitted work uses it.
-            None => unsafe { self.0.mx.mapped_ptr() },
+            None => unsafe { self.0.mx().mapped_ptr() },
         };
         DispatchBufferMappedRange::custom(MxMappedRange {
             // SAFETY: inside the buffer (checked above).
@@ -922,7 +970,7 @@ impl BufferInterface for MxBuffer {
             m.staging.take()
         };
         if let Some(bytes) = staged {
-            let _ = self.0.device.queue.write_buffer(&self.0.mx, 0, &bytes);
+            let _ = self.0.device.queue.write_buffer(self.0.mx(), 0, &bytes);
         }
     }
 
@@ -967,11 +1015,17 @@ impl QueueWriteBufferInterface for MxStaging {
     }
 }
 
-struct MxTexture(mx::Texture);
+struct MxTexture(Option<mx::Texture>);
+
+impl MxTexture {
+    fn raw(&self) -> &mx::Texture {
+        self.0.as_ref().unwrap_or_else(|| invalid("texture"))
+    }
+}
 
 impl TextureInterface for MxTexture {
     fn create_view(&self, desc: &wgpu::TextureViewDescriptor<'_>) -> DispatchTextureView {
-        let v = self.0.create_view(&conv::view(desc)).unwrap_or_else(|e| panic!("mX: {e}"));
+        let v = self.raw().create_view(&conv::view(desc)).unwrap_or_else(|e| panic!("mX: {e}"));
         DispatchTextureView::custom(MxTextureView(v))
     }
 
@@ -1004,7 +1058,7 @@ impl CommandBufferInterface for MxCommandBuffer {}
 
 fn copy_texture<'a>(t: &wgpu::TexelCopyTextureInfo<'a>) -> mx::TexelCopyTextureInfo<'a> {
     mx::TexelCopyTextureInfo {
-        texture: &cast(t.texture.as_custom::<MxTexture>(), "texture").0,
+        texture: cast(t.texture.as_custom::<MxTexture>(), "texture").raw(),
         mip_level: t.mip_level,
         origin: conv::origin(t.origin),
         aspect: conv::aspect(t.aspect),
@@ -1032,13 +1086,13 @@ impl CommandEncoderInterface for MxCommandEncoder {
     ) {
         let (s, d) = (mx_buffer(source), mx_buffer(destination));
         let size = copy_size.unwrap_or(s.size - source_offset);
-        self.with(|e| e.copy_buffer_to_buffer(&s.mx, source_offset, &d.mx, destination_offset, size));
+        self.with(|e| e.copy_buffer_to_buffer(s.mx(), source_offset, d.mx(), destination_offset, size));
     }
 
     fn copy_buffer_to_texture(&self, source: wgpu::TexelCopyBufferInfo<'_>, destination: wgpu::TexelCopyTextureInfo<'_>, copy_size: wgpu::Extent3d) {
         let b = cast(source.buffer.as_custom::<MxBuffer>(), "buffer");
         let src = mx::TexelCopyBufferInfo {
-            buffer: &b.0.mx,
+            buffer: b.0.mx(),
             layout: conv::layout(source.layout),
         };
         self.with(|e| e.copy_buffer_to_texture(src, copy_texture(&destination), conv::extent(copy_size)));
@@ -1047,7 +1101,7 @@ impl CommandEncoderInterface for MxCommandEncoder {
     fn copy_texture_to_buffer(&self, source: wgpu::TexelCopyTextureInfo<'_>, destination: wgpu::TexelCopyBufferInfo<'_>, copy_size: wgpu::Extent3d) {
         let b = cast(destination.buffer.as_custom::<MxBuffer>(), "buffer");
         let dst = mx::TexelCopyBufferInfo {
-            buffer: &b.0.mx,
+            buffer: b.0.mx(),
             layout: conv::layout(destination.layout),
         };
         self.with(|e| e.copy_texture_to_buffer(copy_texture(&source), dst, conv::extent(copy_size)));
@@ -1063,7 +1117,7 @@ impl CommandEncoderInterface for MxCommandEncoder {
             label: desc.label.map(str::to_owned),
             timestamps: desc.timestamp_writes.as_ref().map(|t| {
                 (
-                    cast(t.query_set.as_custom::<MxQuerySet>(), "query set").0.clone(),
+                    cast(t.query_set.as_custom::<MxQuerySet>(), "query set").raw().clone(),
                     t.beginning_of_pass_write_index,
                     t.end_of_pass_write_index,
                 )
@@ -1091,12 +1145,12 @@ impl CommandEncoderInterface for MxCommandEncoder {
                 depth,
                 timestamps: desc.timestamp_writes.as_ref().map(|t| {
                     (
-                        cast(t.query_set.as_custom::<MxQuerySet>(), "query set").0.clone(),
+                        cast(t.query_set.as_custom::<MxQuerySet>(), "query set").raw().clone(),
                         t.beginning_of_pass_write_index,
                         t.end_of_pass_write_index,
                     )
                 }),
-                occlusion: desc.occlusion_query_set.map(|q| cast(q.as_custom::<MxQuerySet>(), "query set").0.clone()),
+                occlusion: desc.occlusion_query_set.map(|q| cast(q.as_custom::<MxQuerySet>(), "query set").raw().clone()),
                 cmds: Vec::new(),
             }),
         })
@@ -1116,12 +1170,12 @@ impl CommandEncoderInterface for MxCommandEncoder {
             base_array_layer: subresource_range.base_array_layer,
             array_layer_count: subresource_range.array_layer_count,
         };
-        self.with(|e| e.clear_texture(&t.0, &r));
+        self.with(|e| e.clear_texture(t.raw(), &r));
     }
 
     fn clear_buffer(&self, buffer: &DispatchBuffer, offset: wgpu::BufferAddress, size: Option<wgpu::BufferAddress>) {
         let b = mx_buffer(buffer);
-        self.with(|e| e.clear_buffer(&b.mx, offset, size));
+        self.with(|e| e.clear_buffer(b.mx(), offset, size));
     }
 
     fn insert_debug_marker(&self, label: &str) {
@@ -1138,13 +1192,13 @@ impl CommandEncoderInterface for MxCommandEncoder {
 
     fn write_timestamp(&self, query_set: &DispatchQuerySet, query_index: u32) {
         let q = cast(query_set.as_custom::<MxQuerySet>(), "query set");
-        self.with(|e| e.write_timestamp(&q.0, query_index));
+        self.with(|e| e.write_timestamp(q.raw(), query_index));
     }
 
     fn resolve_query_set(&self, query_set: &DispatchQuerySet, first_query: u32, query_count: u32, destination: &DispatchBuffer, destination_offset: wgpu::BufferAddress) {
         let q = cast(query_set.as_custom::<MxQuerySet>(), "query set");
         let d = mx_buffer(destination);
-        self.with(|e| e.resolve_query_set(&q.0, first_query..first_query + query_count, &d.mx, destination_offset));
+        self.with(|e| e.resolve_query_set(q.raw(), first_query..first_query + query_count, d.mx(), destination_offset));
     }
 
     fn mark_acceleration_structures_built<'a>(&self, _blas: &mut dyn Iterator<Item = &'a wgpu::Blas>, _tlas: &mut dyn Iterator<Item = &'a wgpu::Tlas>) {}
@@ -1198,8 +1252,8 @@ fn replay(rp: &mut mx::RenderPass<'_>, cmds: &[Cmd], valid: &mut bool) {
                 None => *valid = false,
             },
             Cmd::BindGroup(i, g, o) => rp.set_bind_group(*i, &g.with_offsets(o)),
-            Cmd::VertexBuffer(s, b, o) => rp.set_vertex_buffer(*s, &b.mx, *o),
-            Cmd::IndexBuffer(b, o, f) => rp.set_index_buffer(&b.mx, *o, conv::index_format(*f)),
+            Cmd::VertexBuffer(s, b, o) => rp.set_vertex_buffer(*s, b.mx(), *o),
+            Cmd::IndexBuffer(b, o, f) => rp.set_index_buffer(b.mx(), *o, conv::index_format(*f)),
             Cmd::Viewport(v) => rp.set_viewport(v[0], v[1], v[2], v[3], v[4], v[5]),
             Cmd::Scissor(s) => rp.set_scissor_rect(s[0], s[1], s[2], s[3]),
             Cmd::StencilReference(r) => rp.set_stencil_reference(*r),
@@ -1207,10 +1261,10 @@ fn replay(rp: &mut mx::RenderPass<'_>, cmds: &[Cmd], valid: &mut bool) {
             Cmd::Immediates(o, d) => rp.set_immediates(*o, d),
             Cmd::Draw(v, i) if *valid => rp.draw(v.clone(), i.clone()),
             Cmd::DrawIndexed(ix, b, i) if *valid => rp.draw_indexed(ix.clone(), *b, i.clone()),
-            Cmd::DrawIndirect(b, o) if *valid => rp.draw_indirect(&b.mx, *o),
-            Cmd::DrawIndexedIndirect(b, o) if *valid => rp.draw_indexed_indirect(&b.mx, *o),
-            Cmd::MultiDrawIndirect(b, o, n) if *valid => rp.multi_draw_indirect(&b.mx, *o, *n),
-            Cmd::MultiDrawIndexedIndirect(b, o, n) if *valid => rp.multi_draw_indexed_indirect(&b.mx, *o, *n),
+            Cmd::DrawIndirect(b, o) if *valid => rp.draw_indirect(b.mx(), *o),
+            Cmd::DrawIndexedIndirect(b, o) if *valid => rp.draw_indexed_indirect(b.mx(), *o),
+            Cmd::MultiDrawIndirect(b, o, n) if *valid => rp.multi_draw_indirect(b.mx(), *o, *n),
+            Cmd::MultiDrawIndexedIndirect(b, o, n) if *valid => rp.multi_draw_indexed_indirect(b.mx(), *o, *n),
             Cmd::Draw(..) | Cmd::DrawIndexed(..) | Cmd::DrawIndirect(..) | Cmd::DrawIndexedIndirect(..) | Cmd::MultiDrawIndirect(..) | Cmd::MultiDrawIndexedIndirect(..) => {}
             Cmd::BeginOcclusion(i) => rp.begin_occlusion_query(*i),
             Cmd::EndOcclusion => rp.end_occlusion_query(),
@@ -1460,7 +1514,7 @@ impl Drop for MxComputePass {
                 CCmd::BindGroup(i, g, o) => cp.set_bind_group(*i, &g.with_offsets(o)),
                 CCmd::Immediates(o, d) => cp.set_immediates(*o, d),
                 CCmd::Dispatch(x, y, z) if valid => cp.dispatch_workgroups(*x, *y, *z),
-                CCmd::DispatchIndirect(b, o) if valid => cp.dispatch_workgroups_indirect(&b.mx, *o),
+                CCmd::DispatchIndirect(b, o) if valid => cp.dispatch_workgroups_indirect(b.mx(), *o),
                 CCmd::Dispatch(..) | CCmd::DispatchIndirect(..) => {}
                 CCmd::PushDebug(l) => cp.push_debug_group(l),
                 CCmd::PopDebug => cp.pop_debug_group(),
@@ -1604,7 +1658,7 @@ impl SurfaceInterface for MxSurface {
         let none = || DispatchSurfaceOutputDetail::custom(MxSurfaceOutput(Mutex::new(None)));
         let frame = |s: mx::SurfaceTexture| {
             (
-                Some(DispatchTexture::custom(MxTexture(s.texture.clone()))),
+                Some(DispatchTexture::custom(MxTexture(Some(s.texture.clone())))),
                 DispatchSurfaceOutputDetail::custom(MxSurfaceOutput(Mutex::new(Some(s)))),
             )
         };
