@@ -20,8 +20,6 @@
 //! declare an unbounded array; wgpu-hal always passes a count too), so the HLSL of a module
 //! depends on the heap size (`DeviceDescriptor::bindless_textures`) passed to [`write`].
 
-use std::collections::BTreeSet;
-
 use crate::{HEAP_GROUP, MAX_ROOT_GROUP, Module, RootBinding, RootKind, ShaderError, heap};
 use naga::back::hlsl;
 
@@ -142,20 +140,7 @@ pub fn stage_prefix(stage: naga::ShaderStage) -> &'static str {
 
 /// The root bindings entry point `name` of `stage` uses (as wgpu counts them).
 pub fn roots_for_entry_point(m: &Module, stage: naga::ShaderStage, name: &str) -> Result<Vec<RootBinding>, ShaderError> {
-    let index = m.module.entry_points.iter().position(|e| e.stage == stage && e.name == name).ok_or_else(|| ShaderError::NoEntryPoint {
-        label: m.label.clone(),
-        name: name.into(),
-        stage,
-    })?;
-    let info = m.info.get_entry_point(index);
-    let used: BTreeSet<(u32, u32)> = m
-        .module
-        .global_variables
-        .iter()
-        .filter(|&(h, _)| !info[h].is_empty())
-        .filter_map(|(_, v)| v.binding.map(|b| (b.group, b.binding)))
-        .collect();
-    Ok(m.roots.iter().filter(|r| used.contains(&(r.group, r.binding))).copied().collect())
+    m.entry_point_roots(stage, name)
 }
 
 /// Write one entry point of `m` as HLSL for `shader_model`, with `constants` applied to its
@@ -335,6 +320,17 @@ mod tests {
         assert_eq!(vs, [0, 13]);
         let fs = write(&m, S::Fragment, None, &[], SM, HEAP, None).unwrap();
         assert_eq!(fs.roots.iter().map(|r| r.binding).collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn a_shared_binding_keeps_each_stage_to_its_own_variable() {
+        // as openOMSI's sky motion pass: a texture and a uniform buffer on @group(3) @binding(0)
+        let src = "@group(3) @binding(0) var depth: texture_depth_2d;\n@group(3) @binding(0) var<uniform> motion: vec4<f32>;\n@vertex fn vs() -> @builtin(position) vec4<f32> { return motion; }\n@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(f32(textureDimensions(depth).x)); }\n@fragment fn fs_motion() -> @location(0) vec4<f32> { return motion; }";
+        let m = Module::from_wgsl("t", src).unwrap();
+        let vs = write(&m, S::Vertex, Some("vs"), &[], SM, HEAP, Some((&m, "fs_motion"))).unwrap();
+        assert_eq!(vs.roots.iter().map(|r| r.kind).collect::<Vec<_>>(), [crate::RootKind::UniformBuffer]);
+        let fs = write(&m, S::Fragment, Some("fs"), &[], SM, HEAP, None).unwrap();
+        assert_eq!(fs.roots.iter().map(|r| r.kind).collect::<Vec<_>>(), [crate::RootKind::Texture]);
     }
 
     /// Every shader of `crates/mx/tests/conformance.rs` translates.

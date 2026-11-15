@@ -59,20 +59,7 @@ impl Layout {
     /// what the entry point reads, not everything its module declares (openOMSI's motion
     /// vectors share the scene module, which declares more buffers than one stage takes).
     pub fn for_entry_point(m: &Module, stage: naga::ShaderStage, name: &str) -> Result<Layout, ShaderError> {
-        let index = m.module.entry_points.iter().position(|e| e.stage == stage && e.name == name).ok_or_else(|| ShaderError::NoEntryPoint {
-            label: m.label.clone(),
-            name: name.into(),
-            stage,
-        })?;
-        let info = m.info.get_entry_point(index);
-        let used: std::collections::HashSet<(u32, u32)> = m
-            .module
-            .global_variables
-            .iter()
-            .filter(|&(h, _)| !info[h].is_empty())
-            .filter_map(|(_, v)| v.binding.as_ref().map(|b| (b.group, b.binding)))
-            .collect();
-        Self::assign(m, m.roots.iter().filter(|r| used.contains(&(r.group, r.binding))))
+        Self::assign(m, m.entry_point_roots(stage, name)?.iter())
     }
 
     fn assign<'a>(m: &Module, list: impl Iterator<Item = &'a crate::RootBinding>) -> Result<Layout, ShaderError> {

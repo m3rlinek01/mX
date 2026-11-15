@@ -244,7 +244,6 @@ pub fn write(m: &Module, stage: naga::ShaderStage, entry: Option<&str>, constant
     let ep_info = info.get_entry_point(ep_index);
     let mut heap_bindings_used = 0;
     let mut uses_immediates = false;
-    let mut roots = Vec::new();
     for (h, var) in module.global_variables.iter() {
         if ep_info[h].is_empty() {
             continue;
@@ -255,17 +254,14 @@ pub fn write(m: &Module, stage: naga::ShaderStage, entry: Option<&str>, constant
         let Some(rb) = var.binding else { continue };
         if rb.group == HEAP_GROUP {
             heap_bindings_used |= 1 << rb.binding;
-        } else if let Some(r) = m.roots.iter().find(|r| r.group == rb.group && r.binding == rb.binding) {
-            roots.push(*r);
         }
     }
-    roots.sort_by_key(|r| (r.group, r.binding));
     Ok(Output {
         words,
+        roots: m.entry_point_roots(stage, &name)?,
         entry_point: name,
         heap_bindings_used,
         uses_immediates,
-        roots,
         workgroup_size: ep.workgroup_size,
     })
 }

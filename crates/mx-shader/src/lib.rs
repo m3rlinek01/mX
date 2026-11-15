@@ -101,7 +101,11 @@ pub struct Module {
     pub module: naga::Module,
     pub info: naga::valid::ModuleInfo,
     /// The root bindings any entry point of the module uses, sorted by (group, binding).
+    /// Two of them can share a (group, binding) when no entry point uses both, as WGSL
+    /// allows; [`Module::entry_point_roots`] tells them apart.
     pub roots: Vec<RootBinding>,
+    /// The variable behind each root binding.
+    root_vars: Vec<(naga::Handle<naga::GlobalVariable>, RootBinding)>,
 }
 
 impl fmt::Debug for Module {
@@ -127,12 +131,14 @@ impl Module {
             label: label.into(),
             message: e.emit_to_string(&full),
         })?;
-        let roots = reflect_roots(label, &module)?;
+        let root_vars = reflect_roots(label, &module)?;
+        let roots = root_vars.iter().map(|&(_, r)| r).collect();
         Ok(Module {
             label: label.into(),
             module,
             info,
             roots,
+            root_vars,
         })
     }
 
@@ -154,6 +160,24 @@ impl Module {
     }
 
     /// The module with `override`s resolved for one entry point, ready for a writer.
+    /// The root bindings entry point `name` of `stage` uses, sorted by (group, binding). They
+    /// are found by variable, not by number: openOMSI's scene module has a texture and a
+    /// uniform buffer on one (group, binding), each used by other entry points.
+    pub fn entry_point_roots(&self, stage: naga::ShaderStage, name: &str) -> Result<Vec<RootBinding>, ShaderError> {
+        let index = self
+            .module
+            .entry_points
+            .iter()
+            .position(|e| e.stage == stage && e.name == name)
+            .ok_or_else(|| ShaderError::NoEntryPoint {
+                label: self.label.clone(),
+                name: name.into(),
+                stage,
+            })?;
+        let info = self.info.get_entry_point(index);
+        Ok(self.root_vars.iter().filter(|&&(h, _)| !info[h].is_empty()).map(|&(_, r)| r).collect())
+    }
+
     pub fn specialize(&self, stage: naga::ShaderStage, entry: &str, constants: &[(&str, f64)]) -> Result<(naga::Module, naga::valid::ModuleInfo), ShaderError> {
         let constants: naga::back::PipelineConstants = constants.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         let (module, info) = naga::back::pipeline_constants::process_overrides(&self.module, &self.info, Some((stage, entry)), &constants).map_err(|e| ShaderError::Constants {
@@ -164,10 +188,10 @@ impl Module {
     }
 }
 
-fn reflect_roots(label: &str, module: &naga::Module) -> Result<Vec<RootBinding>, ShaderError> {
+fn reflect_roots(label: &str, module: &naga::Module) -> Result<Vec<(naga::Handle<naga::GlobalVariable>, RootBinding)>, ShaderError> {
     let layout_err = |message: String| ShaderError::Layout { label: label.into(), message };
     let mut roots = Vec::new();
-    for (_, var) in module.global_variables.iter() {
+    for (handle, var) in module.global_variables.iter() {
         let Some(rb) = var.binding else { continue };
         let inner = &module.types[var.ty].inner;
         if rb.group == HEAP_GROUP {
@@ -210,14 +234,17 @@ fn reflect_roots(label: &str, module: &naga::Module) -> Result<Vec<RootBinding>,
             _ => return Err(layout_err(format!("`{}`: unsupported resource type", var.name.as_deref().unwrap_or("?")))),
         };
         let runtime_sized = matches!(kind, RootKind::StorageBuffer { .. }) && ends_in_runtime_array(module, var.ty);
-        roots.push(RootBinding {
-            group: rb.group,
-            binding: rb.binding,
-            kind,
-            runtime_sized,
-        });
+        roots.push((
+            handle,
+            RootBinding {
+                group: rb.group,
+                binding: rb.binding,
+                kind,
+                runtime_sized,
+            },
+        ));
     }
-    roots.sort_by_key(|r| (r.group, r.binding));
+    roots.sort_by_key(|(_, r)| (r.group, r.binding));
     Ok(roots)
 }
 
@@ -279,6 +306,19 @@ mod tests {
                 (1, 2, RootKind::StorageBuffer { read_only: true }, true)
             ]
         );
+    }
+
+    #[test]
+    fn roots_sharing_a_binding_are_told_apart_by_variable() {
+        // valid WGSL: no entry point uses both `depth` and `motion`
+        let m = Module::from_wgsl(
+            "t",
+            "@group(3) @binding(0) var depth: texture_depth_2d;\n@group(3) @binding(0) var<uniform> motion: vec4<f32>;\n@vertex fn vs() -> @builtin(position) vec4<f32> { return motion; }\n@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(f32(textureDimensions(depth).x)); }",
+        )
+        .unwrap();
+        let kinds = |stage, name| m.entry_point_roots(stage, name).unwrap().iter().map(|r| (r.group, r.binding, r.kind)).collect::<Vec<_>>();
+        assert_eq!(kinds(naga::ShaderStage::Vertex, "vs"), [(3, 0, RootKind::UniformBuffer)]);
+        assert_eq!(kinds(naga::ShaderStage::Fragment, "fs"), [(3, 0, RootKind::Texture)]);
     }
 
     #[test]
