@@ -1319,6 +1319,18 @@ impl Surface<'_> {
         Ok(parking_lot::MutexGuard::map(g, |s| s.as_mut().expect("made above")))
     }
 
+    /// Whether `adapter` can present to this surface: on Vulkan its queue is asked (a second
+    /// graphics card may not reach the window's screen); elsewhere any adapter of the
+    /// surface's backend can, and one of another backend cannot.
+    pub fn is_supported_by(&self, adapter: &Adapter) -> bool {
+        let Ok(raw) = self.raw_for(adapter.backend()) else { return false };
+        match (&*raw, adapter) {
+            #[cfg(feature = "vulkan")]
+            (SurfaceRaw::Vulkan(s), Adapter::Vulkan(a)) => s.is_supported_by(a),
+            _ => !self.get_capabilities(adapter).formats.is_empty(),
+        }
+    }
+
     pub fn get_capabilities(&self, adapter: &Adapter) -> t::SurfaceCapabilities {
         let Ok(raw) = self.raw_for(adapter.backend()) else { return Default::default() };
         match (&*raw, adapter) {

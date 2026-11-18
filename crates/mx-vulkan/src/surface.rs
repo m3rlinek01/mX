@@ -327,6 +327,15 @@ fn alpha_mode(want: t::CompositeAlphaMode, have: vk::CompositeAlphaFlagsKHR) -> 
 }
 
 impl Surface<'_> {
+    /// Whether `adapter`'s queue can present to this surface (a second graphics card may
+    /// not reach the window's screen).
+    pub fn is_supported_by(&self, adapter: &Adapter) -> bool {
+        let inst = &self.raw.instance;
+        let Some(s) = &inst.surface else { return false };
+        // SAFETY: a plain query of a live surface, with the family the device is made on.
+        unsafe { s.get_physical_device_surface_support(adapter.0.phys, adapter.0.caps.family, self.raw.raw) }.unwrap_or(false)
+    }
+
     pub fn get_capabilities(&self, adapter: &Adapter) -> t::SurfaceCapabilities {
         let inst = &self.raw.instance;
         let Some(s) = &inst.surface else { return Default::default() };
