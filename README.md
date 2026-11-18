@@ -14,8 +14,8 @@
 </p>
 
 mX is the renderer backend of [openOMSI](https://github.com/openOMSI-org/openOMSI) and replaces
-wgpu there. Every texture view and sampler gets an index in a heap, and shaders pick them by
-that index. A draw needs a pipeline, a few buffers and some bytes of immediates. There are no
+wgpu there. Every texture view, sampler and buffer view gets an index in a heap, and shaders
+pick them by that index. A draw needs a pipeline and some bytes of immediates. There are no
 bind group layouts and no bind groups per material.
 
 Shaders stay in WGSL. mX compiles them with [naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga)
@@ -59,11 +59,14 @@ window and draws into it: `cargo run -p mx --example window`.
   layer between the API and the driver.
 - `wgpu-mx`, an implementation of wgpu 29's API on mX. Point a `wgpu` dependency at it and a
   wgpu renderer builds and runs as it is; openOMSI's does.
+- GPU-driven batches whose draw count the GPU writes: Metal indirect command buffers encoded by
+  a kernel, Vulkan `vkCmdDrawIndexedIndirectCount`, Direct3D 12 `ExecuteIndirect`.
 - Render and compute pipelines, MSAA, render bundles, indirect and multi-draw indirect draws,
   timestamp and occlusion queries, ray queries with acceleration structure refits, surfaces,
   and the native handles that MetalFX, DLSS, FSR 3 and OpenXR need.
 - wgpu's guarantees: a new texture or buffer reads as zeros, queue writes land before the next
-  submission, and no barriers are written by hand.
+  submission, and no barriers are written by hand. mX writes narrow ones itself: per-command
+  stage and access masks on Vulkan, enhanced barriers on Direct3D 12.
 - Low CPU cost per pass: a residency set on macOS 15 and later, and staging rings for queue
   writes on every backend.
 
@@ -74,10 +77,14 @@ window and draws into it: `cargo run -p mx --example window`.
 | macOS 13+, iOS 16+ | Metal 3 | Working. openOMSI runs on it, frames match wgpu in every scene and pass compared, and Metal's API and shader validation report nothing. |
 | Linux, Android | Vulkan 1.3, or 1.2 with dynamic rendering and synchronization2 | Passes every test on MoltenVK and matches wgpu's Vulkan backend there; clean under the Khronos validation layer with synchronization validation. Not yet run on Linux or Android drivers. |
 | Windows | Direct3D 12, or Vulkan with the `vulkan` feature | Complete and compiled for `x86_64-pc-windows-msvc` in CI; not yet run on a GPU. |
+| Older GPUs (Linux, Android, Windows through ANGLE) | OpenGL ES 3.0+ / OpenGL 3.3+ with the `gl` feature: the bound tier, the heap lowered to bindings ([docs/BOUND_TIER.md](docs/BOUND_TIER.md)) | Written and compiled; not yet run on a GPU. |
+| Older Windows GPUs | Direct3D 11 (feature level 11.0, Windows 8+): the bound tier | Written and compiled; not yet run on a GPU. |
+| Older Macs (Intel, AMD), A11-A13 | Metal 2: the bound tier in the Metal backend | Runs mX's conformance tests and openOMSI's renderer (tested on an M4 run as Metal 2). |
+| No GPU (dedicated servers, tests) | The no-op device with the `noop` feature (`Backends::NOOP`, never opened unless asked for) | Written and compiled. |
 
 The `vulkan` feature selects the Vulkan backend on any platform, including macOS through
-MoltenVK. OpenGL is not supported, because the hardware that still needs it has no working
-bindless. [docs/STATUS.md](docs/STATUS.md) lists what is tested and what is not.
+MoltenVK; the `gl` feature selects OpenGL, where the heap is kept on the CPU and shaders read
+it through bindings filled at each draw. [docs/STATUS.md](docs/STATUS.md) lists what is tested and what is not.
 
 ## Performance
 
@@ -104,6 +111,10 @@ main pass, which takes most of the GPU time, runs in 5.1 ms on both.
 | [`mx-metal`](crates/mx-metal) | Metal 3 backend. |
 | [`mx-vulkan`](crates/mx-vulkan) | Vulkan backend. |
 | [`mx-dx12`](crates/mx-dx12) | Direct3D 12 backend. |
+| [`mx-gl`](crates/mx-gl) | OpenGL / OpenGL ES backend (the bound tier). |
+| [`mx-dx11`](crates/mx-dx11) | Direct3D 11 backend (the bound tier). |
+| [`mx-upscale`](crates/mx-upscale) | The vendors' upscalers and frame generators on mX's objects: MetalFX (spatial, temporal, frame interpolation), DLSS (Super Resolution, Ray Reconstruction, Frame Generation), FSR 3.1 (upscaling, frame generation), XeSS (Super Resolution, XeSS-FG). |
+| [`mx-noop`](crates/mx-noop) | The no-op backend: a device that draws nothing (dedicated servers, tests without a GPU). |
 | [`wgpu-mx`](crates/wgpu-mx) | wgpu 29's API on mX. |
 | [`mx-parity`](crates/mx-parity) | Tests that draw the same scenes with wgpu and with mX and compare the pixels. |
 
@@ -133,7 +144,7 @@ loader (`brew install molten-vk vulkan-loader`).
 
 ```sh
 cargo test --workspace
-cargo test -p mx --features vulkan
+MX_BACKENDS=vulkan cargo test -p mx
 cargo check -p mx-dx12 --target x86_64-pc-windows-msvc
 ```
 

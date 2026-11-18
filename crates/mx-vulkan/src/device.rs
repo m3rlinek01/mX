@@ -204,6 +204,9 @@ pub(crate) struct Caps {
     pub core13: bool,
     pub family: u32,
     pub ray_query: bool,
+    /// Buffer device addresses (Vulkan 1.2 `bufferDeviceAddress`): on whenever there, as
+    /// DLSS asks for them.
+    pub device_address: bool,
     pub timestamps: bool,
     pub bc: bool,
     pub d24s8: bool,
@@ -211,6 +214,8 @@ pub(crate) struct Caps {
     pub portability: bool,
     pub swapchain: bool,
     pub multi_draw_indirect: bool,
+    /// `drawIndirectCount` (Vulkan 1.2): GPU-driven draw counts.
+    pub draw_indirect_count: bool,
     pub precise_occlusion: bool,
     pub anisotropy: bool,
     pub robust_buffer_access: bool,
@@ -227,6 +232,7 @@ pub(crate) struct Caps {
     pub f12_int8: bool,
     pub f12_float16: bool,
     pub f12_ubo_std_layout: bool,
+    pub max_storage_buffer_range: u64,
     pub update_unused_while_pending: bool,
     pub limits: t::Limits,
     pub timestamp_period: f32,
@@ -313,6 +319,8 @@ impl Adapter {
                 (f12.descriptor_binding_partially_bound, "descriptorBindingPartiallyBound"),
                 (f12.descriptor_binding_sampled_image_update_after_bind, "descriptorBindingSampledImageUpdateAfterBind"),
                 (f12.shader_sampled_image_array_non_uniform_indexing, "shaderSampledImageArrayNonUniformIndexing"),
+                (f12.descriptor_binding_storage_buffer_update_after_bind, "descriptorBindingStorageBufferUpdateAfterBind"),
+                (f12.shader_storage_buffer_array_non_uniform_indexing, "shaderStorageBufferArrayNonUniformIndexing"),
                 (f12.timeline_semaphore, "timelineSemaphore"),
                 (dynamic_rendering, "dynamicRendering"),
                 (synchronization2, "synchronization2"),
@@ -338,6 +346,13 @@ impl Adapter {
             raw.get_physical_device_properties2(phys, &mut p2);
             let samplers = (di.max_descriptor_set_update_after_bind_samplers.min(di.max_per_stage_descriptor_update_after_bind_samplers) / 2).min(4096);
             let resources = di.max_per_stage_update_after_bind_resources.saturating_sub(2 * samplers + 256);
+            // (an eighth of the per-stage resources for buffer views, the rest for textures)
+            let buffers = di
+                .max_descriptor_set_update_after_bind_storage_buffers
+                .min(di.max_per_stage_descriptor_update_after_bind_storage_buffers)
+                .min(resources / 8)
+                .min(500_000);
+            let resources = resources - buffers;
             let textures = (di
                 .max_descriptor_set_update_after_bind_sampled_images
                 .min(di.max_per_stage_descriptor_update_after_bind_sampled_images)
@@ -350,10 +365,16 @@ impl Adapter {
                 max_texture_array_layers: l.max_image_array_layers,
                 max_bindless_textures: textures,
                 max_bindless_samplers: samplers,
+                max_bindless_buffers: buffers,
+                buffer_view_offset_alignment: (l.min_storage_buffer_offset_alignment as u32).max(4),
                 max_immediate_size: l.max_push_constants_size,
                 max_vertex_buffers: l.max_vertex_input_bindings.min(8),
                 max_root_buffers: l.max_per_stage_descriptor_uniform_buffers.min(l.max_per_stage_descriptor_storage_buffers),
                 max_color_attachments: l.max_color_attachments.min(8),
+                max_buffer_size: 1 << 31,
+                max_storage_buffer_binding_size: l.max_storage_buffer_range as u64,
+                min_uniform_buffer_offset_alignment: 256,
+                min_storage_buffer_offset_alignment: 256,
             };
             let fmt_ok = |f: vk::Format, need: vk::FormatFeatureFlags| raw.get_physical_device_format_properties(phys, f).optimal_tiling_features.contains(need);
             let caps = Caps {
@@ -361,6 +382,7 @@ impl Adapter {
                 core13,
                 family,
                 ray_query: ray_exts && accel.acceleration_structure != 0 && rq.ray_query != 0 && f12.buffer_device_address != 0,
+                device_address: f12.buffer_device_address != 0,
                 timestamps: l.timestamp_compute_and_graphics != 0 && families[family as usize].timestamp_valid_bits > 0,
                 bc: core.texture_compression_bc != 0,
                 d24s8: fmt_ok(vk::Format::D24_UNORM_S8_UINT, vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT),
@@ -371,6 +393,7 @@ impl Adapter {
                 portability,
                 swapchain: has_ext(&extensions, khr::swapchain::NAME),
                 multi_draw_indirect: core.multi_draw_indirect != 0,
+                draw_indirect_count: f12.draw_indirect_count != 0,
                 precise_occlusion: core.occlusion_query_precise != 0,
                 anisotropy: core.sampler_anisotropy != 0,
                 // (wgpu-hal's choices, which decide its bounds checks)
@@ -388,6 +411,7 @@ impl Adapter {
                 f12_float16: f12.shader_float16 != 0,
                 f12_ubo_std_layout: f12.uniform_buffer_standard_layout != 0,
                 update_unused_while_pending: f12.descriptor_binding_update_unused_while_pending != 0,
+                max_storage_buffer_range: l.max_storage_buffer_range as u64,
                 limits,
                 timestamp_period: l.timestamp_period,
                 scratch_alignment: asp.min_acceleration_structure_scratch_offset_alignment.max(1) as u64,
@@ -429,12 +453,80 @@ impl Adapter {
         self.0.caps.limits
     }
 
+    /// The GPU's memory: its largest device-local heap (the budget is not asked for).
+    pub fn memory_info(&self) -> Option<t::AdapterMemory> {
+        // SAFETY: a plain query of a live physical device.
+        let mem = unsafe { self.0.instance.raw.get_physical_device_memory_properties(self.0.phys) };
+        let largest = mem.memory_heaps[..mem.memory_heap_count as usize]
+            .iter()
+            .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|h| h.size)
+            .max()?;
+        Some(t::AdapterMemory {
+            dedicated_bytes: largest,
+            budget_bytes: None,
+        })
+    }
+
+    /// Whether `format` renders and resolves with `samples` samples per pixel.
+    pub fn supports_msaa(&self, format: t::TextureFormat, samples: u32) -> bool {
+        if samples <= 1 {
+            return true;
+        }
+        let l = &self.0.props.limits;
+        let counts = if format.has_depth() {
+            l.framebuffer_depth_sample_counts
+        } else {
+            l.framebuffer_color_sample_counts
+        };
+        counts.contains(vk::SampleCountFlags::from_raw(samples))
+    }
+
+    /// Textures a pipeline may read through root bindings (on OpenGL, through anything: texture
+    /// units): (vertex stage, fragment stage, the pipeline together).
+    pub fn texture_units(&self) -> (u32, u32, u32) {
+        {
+            let l = &self.0.props.limits;
+            (
+                l.max_per_stage_descriptor_sampled_images,
+                l.max_per_stage_descriptor_sampled_images,
+                l.max_descriptor_set_sampled_images,
+            )
+        }
+    }
+
+    /// Indexed draws with a base vertex (not below OpenGL 3.2 / ES 3.2).
+    pub fn supports_base_vertex(&self) -> bool {
+        true
+    }
+
     pub fn supports_bc(&self) -> bool {
         self.0.caps.bc
     }
 
     pub fn supports_ray_query(&self) -> bool {
         self.0.caps.ray_query
+    }
+
+    /// Compute shaders: every bindless device has them.
+    pub fn supports_compute(&self) -> bool {
+        true
+    }
+
+    /// How many storage buffers the vertex and fragment stages may read as root bindings
+    /// (any number through the heap).
+    pub fn storage_buffers_per_stage(&self) -> (u32, u32) {
+        (self.0.caps.limits.max_root_buffers, self.0.caps.limits.max_root_buffers)
+    }
+
+    /// Whether this GPU runs on the bound tier: the heap bound slot by slot at each draw,
+    /// heap accesses indexed by immediates or constants only.
+    pub fn is_bound_tier(&self) -> bool {
+        false
+    }
+    /// GPU-driven draw counts (`Device::create_indirect_draws`).
+    pub fn supports_indirect_count(&self) -> bool {
+        self.0.caps.draw_indirect_count
     }
 
     pub fn supports_timestamps(&self) -> bool {
@@ -446,13 +538,26 @@ impl Adapter {
         self.0.phys
     }
 
+    /// The `VkInstance` the adapter belongs to, for interop.
+    pub fn raw_instance(&self) -> &ash::Instance {
+        &self.0.instance.raw
+    }
+
+    /// The device extensions the adapter has.
+    pub fn extensions(&self) -> Vec<std::ffi::CString> {
+        // SAFETY: a query of the adapter's own physical device.
+        let props = unsafe { self.0.instance.raw.enumerate_device_extension_properties(self.0.phys) }.unwrap_or_default();
+        props.iter().filter_map(|p| p.extension_name_as_c_str().ok().map(CStr::to_owned)).collect()
+    }
+
     pub fn request_device(&self, desc: &DeviceDescriptor<'_>) -> Result<(Device, Queue)> {
         let a = &self.0;
         let caps = &a.caps;
         let inst = &a.instance.raw;
         let textures = desc.bindless_textures.min(caps.limits.max_bindless_textures);
         let samplers = desc.bindless_samplers.min(caps.limits.max_bindless_samplers);
-        if textures == 0 || samplers == 0 {
+        let buffers = desc.bindless_buffers.min(caps.limits.max_bindless_buffers);
+        if textures == 0 || samplers == 0 || buffers == 0 {
             return Err(Error::Unsupported("a bindless heap (descriptor indexing)".into()));
         }
 
@@ -477,6 +582,18 @@ impl Adapter {
             exts.push(khr::acceleration_structure::NAME);
             exts.push(khr::ray_query::NAME);
             exts.push(khr::deferred_host_operations::NAME);
+        }
+        // (what the program asks for besides: DLSS's extensions)
+        if !desc.extensions.is_empty() {
+            let available = unsafe { inst.enumerate_device_extension_properties(a.phys) }.map_err(|e| vk_err("device extensions", e))?;
+            for e in desc.extensions {
+                if !available.iter().any(|a| a.extension_name_as_c_str().ok() == Some(*e)) {
+                    return Err(Error::Unsupported(format!("the device extension {}", e.to_string_lossy())));
+                }
+                if !exts.contains(e) {
+                    exts.push(e);
+                }
+            }
         }
         let ext_ptrs: Vec<*const std::ffi::c_char> = exts.iter().map(|e| e.as_ptr()).collect();
 
@@ -516,11 +633,14 @@ impl Adapter {
             .descriptor_binding_sampled_image_update_after_bind(true)
             .descriptor_binding_update_unused_while_pending(caps.update_unused_while_pending)
             .shader_sampled_image_array_non_uniform_indexing(true)
+            .descriptor_binding_storage_buffer_update_after_bind(true)
+            .shader_storage_buffer_array_non_uniform_indexing(true)
             .timeline_semaphore(true)
+            .draw_indirect_count(caps.draw_indirect_count)
             .shader_int8(caps.f12_int8)
             .shader_float16(caps.f12_float16)
             .uniform_buffer_standard_layout(caps.f12_ubo_std_layout)
-            .buffer_device_address(caps.ray_query);
+            .buffer_device_address(caps.device_address);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true)
@@ -591,14 +711,14 @@ impl Adapter {
         let mut sem_type = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
         // SAFETY: a plain creation on the new device.
         let timeline = unsafe { raw.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut sem_type), None) }.map_err(|e| vk_err("timeline semaphore", e))?;
-        let heap = Heap::new(&raw, textures, samplers, caps.update_unused_while_pending, caps.portability)?;
-        let (textures, samplers) = heap.capacity();
+        let heap = Heap::new(&raw, textures, samplers, buffers, caps.update_unused_while_pending, caps.portability)?;
+        let (textures, samplers, buffers) = heap.capacity();
         let vendor = a.props.vendor_id;
         let shared = Arc::new(Shared {
             instance: a.instance.clone(),
             phys: a.phys,
             raw,
-            queue: Mutex::new(queue),
+            queue: parking_lot::ReentrantMutex::new(queue),
             caps: caps.clone(),
             fns,
             allocator: ManuallyDrop::new(Mutex::new(allocator)),
@@ -619,8 +739,10 @@ impl Adapter {
             limits: t::Limits {
                 max_bindless_textures: textures,
                 max_bindless_samplers: samplers,
+                max_bindless_buffers: buffers,
                 ..caps.limits
-            },
+            }
+            .capped(desc.limits.as_ref()),
             spirv: mx_shader::spirv::Options {
                 lang_version: if caps.api_version >= vk::API_VERSION_1_3 { (1, 6) } else { (1, 5) },
                 ray_query: caps.ray_query,
@@ -653,14 +775,25 @@ pub struct DeviceDescriptor<'a> {
     pub bindless_textures: u32,
     /// Samplers the heap holds at once.
     pub bindless_samplers: u32,
+    /// Buffer views the heap holds at once.
+    pub bindless_buffers: u32,
+    /// Device extensions to turn on besides mX's own (DLSS's); one the device lacks fails
+    /// `request_device` with `Error::Unsupported`.
+    pub extensions: &'a [&'static CStr],
+    /// Limits the device keeps to, where lower than the adapter's (a weaker chip's, to
+    /// test on); None: the adapter's.
+    pub limits: Option<t::Limits>,
 }
 
 impl Default for DeviceDescriptor<'_> {
     fn default() -> Self {
         DeviceDescriptor {
+            limits: None,
             label: None,
             bindless_textures: 1 << 16,
             bindless_samplers: 2048,
+            bindless_buffers: 1 << 15,
+            extensions: &[],
         }
     }
 }
@@ -788,7 +921,9 @@ pub(crate) struct Shared {
     pub instance: Arc<InstanceShared>,
     pub phys: vk::PhysicalDevice,
     pub raw: ash::Device,
-    pub queue: Mutex<vk::Queue>,
+    /// (reentrant: a vendor's swapchain submits to the queue from inside the present that holds
+    /// it, through `Queue::with_raw`)
+    pub queue: parking_lot::ReentrantMutex<vk::Queue>,
     pub caps: Caps,
     pub fns: Fns,
     pub allocator: ManuallyDrop<Mutex<Allocator>>,
@@ -902,6 +1037,16 @@ impl Shared {
         self.barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&b));
     }
 
+    /// Copies after wait for copies before, and see what they wrote.
+    pub fn transfer_barrier(&self, cmd: vk::CommandBuffer) {
+        let b = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE)];
+        self.barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&b));
+    }
+
     /// A layout transition of a whole image.
     pub fn transition(&self, cmd: vk::CommandBuffer, image: vk::Image, aspect: vk::ImageAspectFlags, from: vk::ImageLayout, to: vk::ImageLayout) {
         let b = [vk::ImageMemoryBarrier2::default()
@@ -929,7 +1074,8 @@ impl Shared {
         let mut p = self.pending.lock();
         let p = match p.as_mut() {
             Some(p) => {
-                self.full_barrier(p.cmd);
+                // (the writes before are copies: the next copy waits for them)
+                self.transfer_barrier(p.cmd);
                 p
             }
             None => {
@@ -1271,6 +1417,11 @@ impl Device {
         self.shared.limits
     }
 
+    /// Buffer views in the heap right now.
+    pub fn bindless_buffers_in_use(&self) -> usize {
+        self.shared.heap.lock().buffers_in_use()
+    }
+
     /// Note finished work and free what it held, without waiting.
     pub fn poll(&self) -> Result<()> {
         self.shared.poll(None)
@@ -1288,6 +1439,16 @@ impl Device {
 
     pub fn wait_idle(&self) -> Result<()> {
         self.shared.wait_idle()
+    }
+
+    /// BC texture compression (as the adapter's `supports_bc`).
+    pub fn supports_bc(&self) -> bool {
+        self.shared.caps.bc
+    }
+
+    /// Timestamp queries (as the adapter's `supports_timestamps`).
+    pub fn supports_timestamps(&self) -> bool {
+        self.shared.caps.timestamps
     }
 
     /// Texture views in the heap right now.
@@ -1333,8 +1494,21 @@ impl Queue {
     }
 
     /// The `VkQueue`, for interop. Submissions to it must not overlap mX's own (mX locks it
-    /// while submitting).
+    /// while submitting): see [`Queue::with_raw`].
     pub fn raw(&self) -> vk::Queue {
         *self.shared.queue.lock()
+    }
+
+    /// `f` with the `VkQueue`, mX's own submissions held off meanwhile: where a program
+    /// submits work of its own (DLSS, FSR 3) between mX's. Images rest in `GENERAL` between
+    /// mX's commands; the work leaves them there.
+    pub fn with_raw<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
+        let q = self.shared.queue.lock();
+        f(*q)
+    }
+
+    /// The index of the queue in its family.
+    pub fn queue_index(&self) -> u32 {
+        0
     }
 }

@@ -10,6 +10,11 @@
 //! | 8..=13 | `t0` .. `t{heap size - 1}` | heap texture binding `space - 8` (`heap::TEX_2D` .. `heap::TEX_2D_U32`) |
 //! | 14    | `s0` / `s2048` | naga's sampler heaps (`nagaSamplerHeap`, `nagaComparisonSamplerHeap`), 2048 each |
 //! | 15    | `b0` / `b1` | immediates (root constants) / naga's special constants (first vertex, first instance, workgroup count) |
+//! | 16 + `b` | `t0` .. / `u0` .. | view `b` of the buffer heap (`heap::BUFFERS`, `heap::RW_BUFFERS`, a shader's own): `ByteAddressBuffer`s when read-only, `RWByteAddressBuffer`s when written |
+//!
+//! Buffers: every buffer view in the heap has a raw SRV and a raw UAV in the shader-visible
+//! CBV/SRV/UAV heap, after the texture slots. Each view a shader declares gets its own space,
+//! and the root signature points all of them at the same descriptors.
 //!
 //! Samplers: naga's HLSL backend (as wgpu-hal uses it) reaches every sampler through one
 //! shader-visible sampler heap and a per-group `StructuredBuffer<uint>` of heap indices. For a
@@ -44,9 +49,19 @@ pub const SPECIAL_CONSTANTS_REGISTER: u32 = 1;
 /// and the immediates and naga's special constants are two of them.
 pub const MAX_UNIFORM_BUFFERS: u32 = 12;
 
-/// The space of heap texture binding `binding`.
+/// The space of buffer view 0 of the heap; view `b` is in `BUFFER_SPACE + b`.
+pub const BUFFER_SPACE: u32 = 16;
+
+/// The space of heap texture binding `binding`, or of buffer view `binding`.
 pub const fn heap_space(binding: u32) -> u32 {
-    HEAP_SPACE + binding
+    if heap::is_buffer(binding) { BUFFER_SPACE + binding } else { HEAP_SPACE + binding }
+}
+
+/// How large the heap's arrays are declared (naga's HLSL writer needs a length).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapSizes {
+    pub textures: u32,
+    pub buffers: u32,
 }
 
 fn target(space: u32, register: u32) -> hlsl::BindTarget {
@@ -60,14 +75,19 @@ fn target(space: u32, register: u32) -> hlsl::BindTarget {
 }
 
 /// The options wgpu-hal's D3D12 backend writes HLSL with, with mX's register layout.
-pub fn options(m: &Module, shader_model: ShaderModel, heap_textures: u32) -> hlsl::Options {
+pub fn options(m: &Module, shader_model: ShaderModel, heap: HeapSizes) -> hlsl::Options {
     let mut binding_map = hlsl::BindingMap::default();
     for (_, var) in m.module.global_variables.iter() {
         let Some(rb) = var.binding else { continue };
         let bt = if rb.group == HEAP_GROUP {
             if heap::is_texture(rb.binding) {
                 hlsl::BindTarget {
-                    binding_array_size: Some(heap_textures),
+                    binding_array_size: Some(heap.textures),
+                    ..target(heap_space(rb.binding), 0)
+                }
+            } else if heap::is_buffer(rb.binding) {
+                hlsl::BindTarget {
+                    binding_array_size: Some(heap.buffers),
                     ..target(heap_space(rb.binding), 0)
                 }
             } else {
@@ -118,8 +138,8 @@ pub struct Output {
     pub entry_point: String,
     /// The compile target, e.g. `vs_6_5`.
     pub profile: String,
-    /// Which heap bindings the entry point reads (bit per `heap::*`).
-    pub heap_bindings_used: u32,
+    /// Which heap bindings the entry point reads (bit per `heap::*` and buffer view).
+    pub heap_bindings_used: u64,
     pub uses_immediates: bool,
     /// The root bindings the entry point uses, sorted by (group, binding).
     pub roots: Vec<RootBinding>,
@@ -144,7 +164,7 @@ pub fn roots_for_entry_point(m: &Module, stage: naga::ShaderStage, name: &str) -
 }
 
 /// Write one entry point of `m` as HLSL for `shader_model`, with `constants` applied to its
-/// `override`s and the heap's texture arrays `heap_textures` long. For a vertex entry point,
+/// `override`s and the heap's arrays `heap` long. For a vertex entry point,
 /// pass the fragment stage it is paired with (as wgpu-hal does): HLSL needs the vertex
 /// outputs to match the fragment inputs.
 pub fn write(
@@ -153,7 +173,7 @@ pub fn write(
     entry: Option<&str>,
     constants: &[(&str, f64)],
     shader_model: ShaderModel,
-    heap_textures: u32,
+    heap: HeapSizes,
     fragment: Option<(&Module, &str)>,
 ) -> Result<Output, ShaderError> {
     let name = m.entry_point(stage, entry)?.name.clone();
@@ -178,7 +198,7 @@ pub fn write(
         Some((fm, fname)) => Some(hlsl::FragmentEntryPoint::new(&fm.module, fname).ok_or_else(|| backend_err(format!("no fragment entry point `{fname}` to pair with")))?),
         None => None,
     };
-    let options = options(m, shader_model, heap_textures);
+    let options = options(m, shader_model, heap);
     let pipeline = hlsl::PipelineOptions {
         entry_point: Some((stage, name.clone())),
     };
@@ -198,21 +218,8 @@ pub fn write(
         .find(|(_, e)| e.stage == stage && e.name == name)
         .ok_or_else(|| backend_err("entry point lost".into()))?;
     let ep_info = info.get_entry_point(ep_index);
-    let mut heap_bindings_used = 0;
-    let mut uses_immediates = false;
-    for (h, var) in module.global_variables.iter() {
-        if ep_info[h].is_empty() {
-            continue;
-        }
-        if var.space == naga::AddressSpace::Immediate {
-            uses_immediates = true;
-        }
-        if let Some(rb) = var.binding
-            && rb.group == HEAP_GROUP
-        {
-            heap_bindings_used |= 1 << rb.binding;
-        }
-    }
+    let heap_bindings_used = crate::heap_used(&module, |h| !ep_info[h].is_empty());
+    let uses_immediates = module.global_variables.iter().any(|(h, v)| v.space == naga::AddressSpace::Immediate && !ep_info[h].is_empty());
     Ok(Output {
         source,
         entry_point,
@@ -230,10 +237,31 @@ mod tests {
     use naga::ShaderStage as S;
 
     const SM: ShaderModel = ShaderModel::V6_5;
-    const HEAP: u32 = 1 << 16;
+    const HEAP: HeapSizes = HeapSizes { textures: 1 << 16, buffers: 1 << 14 };
 
     fn compact(s: &str) -> String {
         s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn buffer_views_are_indexed_byte_address_buffers() {
+        let m = Module::from_wgsl(
+            "t",
+            "struct L { l: array<vec4<f32>> }\n@group(7) @binding(16) var<storage, read> lights: binding_array<L>;\nstruct D { a: u32, b: u32 }\nvar<immediate> d: D;\n@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3<u32>) { mx_rw_buffers[d.b].w[id.x] = u32(lights[d.a].l[id.x].x); atomicAdd(&counters[d.b].c, 1u); }\nstruct C { c: atomic<u32> }\n@group(7) @binding(18) var<storage, read_write> counters: binding_array<C>;",
+        )
+        .unwrap();
+        let out = write(&m, S::Compute, None, &[], SM, HEAP, None).unwrap();
+        let src = compact(&out.source);
+        for want in [
+            "ByteAddressBuffer lights[16384] : register(t0, space32)",
+            "RWByteAddressBuffer mx_rw_buffers[16384] : register(u0, space25)",
+            "RWByteAddressBuffer counters[16384] : register(u0, space34)",
+            "lights[_e",
+            "mx_rw_buffers[_e",
+            "counters[_e",
+        ] {
+            assert!(src.contains(want), "missing `{want}` in:\n{}", out.source);
+        }
     }
 
     #[test]

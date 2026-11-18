@@ -553,6 +553,135 @@ impl Device {
     }
 }
 
+/// Lays out GPU-driven draw arguments as the pipelines' command signatures read them: naga's
+/// special constants (first vertex or base vertex, first instance, 0), then the API's
+/// arguments (see `RenderPass::indirect`).
+const INDIRECT_SHADER: &str = "
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<u32>;
+struct P { max_draws: u32, indexed: u32 }
+var<immediate> p: P;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if (i >= p.max_draws) { return; }
+    let n = select(4u, 5u, p.indexed != 0u);
+    let s = i * n;
+    let d = i * (n + 3u);
+    dst[d] = src[s + n - 2u];
+    dst[d + 1u] = src[s + n - 1u];
+    dst[d + 2u] = 0u;
+    for (var k = 0u; k < n; k++) { dst[d + 3u + k] = src[s + k]; }
+}
+";
+
+impl Device {
+    fn indirect_tool(&self) -> crate::ComputePipeline {
+        let mut tool = self.shared.indirect.lock();
+        tool.get_or_insert_with(|| {
+            let m = self
+                .create_shader_module(&crate::ShaderModuleDescriptor {
+                    label: Some("mX indirect draws"),
+                    source: INDIRECT_SHADER,
+                })
+                .expect("the indirect draw shader compiles");
+            self.create_compute_pipeline(&t::ComputePipelineDescriptor {
+                label: Some("mX indirect draws"),
+                module: &m,
+                entry_point: None,
+                constants: &[],
+            })
+            .expect("the indirect draw pipeline is made")
+        })
+        .clone()
+    }
+
+    /// A batch of GPU-driven draws: a buffer its arguments are laid out into for
+    /// `ExecuteIndirect`.
+    pub fn create_indirect_draws(&self, desc: &t::IndirectDrawsDescriptor<'_>) -> crate::Result<crate::IndirectDraws> {
+        let stride = if desc.indexed { 32 } else { 28 };
+        let laid_out = self.create_buffer(&t::BufferDescriptor {
+            label: desc.label,
+            size: (desc.max_draws.max(1) as u64) * stride,
+            usage: t::BufferUsages::STORAGE | t::BufferUsages::INDIRECT,
+        })?;
+        Ok(crate::IndirectDraws(std::sync::Arc::new(crate::resource::IndirectDrawsInner {
+            max_draws: desc.max_draws,
+            indexed: desc.indexed,
+            laid_out,
+            source: parking_lot::Mutex::new(None),
+        })))
+    }
+}
+
+impl CommandEncoder {
+    /// Point a batch of GPU-driven draws at the arguments and the count the GPU wrote:
+    /// `count` (a `u32` at `count_offset`) draws of `args` from `args_offset`, at most the
+    /// batch's `max_draws`, drawn with `pipeline` and the index buffer `index` (indexed
+    /// batches). Outside passes, after the arguments are written and before the pass that
+    /// executes the batch: a dispatch lays them out for `ExecuteIndirect` here. `args` needs
+    /// `STORAGE | INDIRECT`, `count` `INDIRECT`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_indirect_draws(
+        &mut self,
+        draws: &crate::IndirectDraws,
+        pipeline: &RenderPipeline,
+        args: &Buffer,
+        args_offset: u64,
+        count: &Buffer,
+        count_offset: u64,
+        index: Option<(&Buffer, u64, t::IndexFormat)>,
+    ) {
+        let _ = pipeline;
+        assert_eq!(draws.0.indexed, index.is_some(), "an indexed batch needs an index buffer, and only it");
+        assert!(
+            args.usage().contains(t::BufferUsages::STORAGE | t::BufferUsages::INDIRECT),
+            "GPU-driven draw arguments need STORAGE | INDIRECT usage"
+        );
+        assert!(count.usage().contains(t::BufferUsages::INDIRECT), "a GPU-driven draw count needs INDIRECT usage");
+        let device = Device { shared: self.rec.shared.clone() };
+        let tool = device.indirect_tool();
+        let n = if draws.0.indexed { 20 } else { 16 };
+        let bg = device.create_bind_group(&crate::BindGroupDescriptor {
+            label: None,
+            entries: &[
+                crate::BindGroupEntry {
+                    binding: 0,
+                    resource: crate::BindingResource::Buffer(crate::BufferBinding {
+                        buffer: args,
+                        offset: args_offset,
+                        size: Some((draws.0.max_draws.max(1) as u64 * n).min(args.size() - args_offset)),
+                    }),
+                },
+                crate::BindGroupEntry {
+                    binding: 1,
+                    resource: crate::BindingResource::Buffer(crate::BufferBinding {
+                        buffer: &draws.0.laid_out,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+            ],
+        });
+        {
+            let mut cp = self.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&tool);
+            cp.set_bind_group(0, &bg);
+            cp.set_immediates(0, bytemuck_u32(&[draws.0.max_draws, draws.0.indexed as u32]));
+            cp.dispatch_workgroups(draws.0.max_draws.div_ceil(64).max(1), 1, 1);
+        }
+        *draws.0.source.lock() = Some(crate::resource::IndirectSource {
+            count: count.clone(),
+            count_offset,
+            index: index.map(|(b, o, f)| (b.clone(), o, f)),
+        });
+    }
+}
+
+fn bytemuck_u32(v: &[u32]) -> &[u8] {
+    // SAFETY: u32 has no padding and u8 has no alignment needs.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+}
+
 /// Bindings set on a pass and not yet handed to the command list.
 struct PassState {
     groups: [Option<BindGroup>; GROUPS],
@@ -561,6 +690,8 @@ struct PassState {
     immediates: Box<[u8; MAX_IMMEDIATES]>,
     immediates_dirty: bool,
     special: Option<[u32; 3]>,
+    /// Offsets added to root uniform buffers' own (`set_buffer_offset`): (group, binding, bytes).
+    offsets: Vec<(u32, u32, u64)>,
 }
 
 impl Default for PassState {
@@ -571,6 +702,7 @@ impl Default for PassState {
             immediates: Box::new([0; MAX_IMMEDIATES]),
             immediates_dirty: true,
             special: None,
+            offsets: Vec::new(),
         }
     }
 }
@@ -614,6 +746,22 @@ fn bind_heap(rec: &Recording, r: &impl Roots, state: &mut PassState) {
     state.special = None;
 }
 
+/// Put the buffers with heap views in the states shaders reach them in (see
+/// `Heap::buffer_states`), unless nothing changed since the last time in this list.
+fn need_heap_buffers(rec: &mut Recording) {
+    let shared = rec.shared.clone();
+    let heap = shared.heap.lock();
+    let settled = rec.track.buffers_settled();
+    if settled && rec.heap_buffers_applied == heap.buffer_generation {
+        return;
+    }
+    for (track, state) in heap.buffer_states() {
+        rec.track.need(track, None, state);
+    }
+    rec.track.buffers_settled();
+    rec.heap_buffers_applied = heap.buffer_generation;
+}
+
 /// Write the root tables the pipeline reads and move their resources to the states they are
 /// read in. Returns whether a storage resource is bound (written).
 fn bind_roots(rec: &mut Recording, r: &impl Roots, layout: &Layout, state: &mut PassState, label: &str) -> bool {
@@ -635,7 +783,21 @@ fn bind_roots(rec: &mut Recording, r: &impl Roots, layout: &Layout, state: &mut 
                 panic!("{label}: draw with nothing bound at @group({g}) @binding({b})");
             };
             let mismatch = || panic!("{label}: the resource at @group({g}) @binding({b}) is not the kind the shader declares ({kind:?})");
+            let extra = state.offsets.iter().find(|o| o.0 == g as u32 && o.1 == b).map(|o| o.2);
             let src = match (kind, bound) {
+                (RootKind::UniformBuffer, Bound::Buffer { buffer, offset, size, .. }) if extra.is_some() => {
+                    let extra = extra.unwrap_or(0);
+                    rec.track.need(&buffer.0.track, None, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+                    // (at `set_buffer_offset`'s offset: a view of its own, written into the ring)
+                    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                        BufferLocation: buffer.0.va + offset + extra,
+                        SizeInBytes: (*size).max(1).next_multiple_of(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT as u64) as u32,
+                    };
+                    // SAFETY: a view of a live buffer into this list's ring descriptors.
+                    unsafe { device.CreateConstantBufferView(Some(&desc), views.view_cpu(at)) };
+                    at += 1;
+                    continue;
+                }
                 (RootKind::UniformBuffer, Bound::Buffer { buffer, cbv: Some(d), .. }) => {
                     rec.track.need(&buffer.0.track, None, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
                     *d
@@ -768,6 +930,19 @@ impl RenderPass<'_> {
     pub fn set_bind_group(&mut self, group: u32, bind_group: &BindGroup) {
         assert!(group <= MAX_ROOT_GROUP, "root bind groups are 0..={MAX_ROOT_GROUP}; group {} is the heap", mx_shader::HEAP_GROUP);
         self.state.groups[group as usize] = Some(bind_group.clone());
+        self.state.offsets.retain(|o| o.0 != group);
+        self.state.dirty |= 1 << group;
+    }
+
+    /// Read the buffer at (`group`, `binding`) of the bind group set at `group` from `offset`
+    /// bytes past its own offset, for the draws that follow (until that group is set again):
+    /// a draw's constants in one buffer of many. A multiple of 256; uniform buffers only on
+    /// this backend.
+    pub fn set_buffer_offset(&mut self, group: u32, binding: u32, offset: u64) {
+        match self.state.offsets.iter_mut().find(|o| o.0 == group && o.1 == binding) {
+            Some(o) => o.2 = offset,
+            None => self.state.offsets.push((group, binding, offset)),
+        }
         self.state.dirty |= 1 << group;
     }
 
@@ -826,6 +1001,7 @@ impl RenderPass<'_> {
         self.index = None;
         self.vertex = Default::default();
         self.state.groups = Default::default();
+        self.state.offsets.clear();
         self.state.dirty = !0;
         self.state.immediates_dirty = true;
     }
@@ -846,10 +1022,13 @@ impl RenderPass<'_> {
             rec.track.need(&b.0.track, None, D3D12_RESOURCE_STATE_INDEX_BUFFER);
         }
         let writes = bind_roots(rec, &r, &p.layout, &mut self.state, &p.label);
+        if p.layout.heap_buffers {
+            need_heap_buffers(rec);
+        }
         if rec.uav_dirty {
             rec.track.uav_barrier();
         }
-        rec.uav_dirty = writes;
+        rec.uav_dirty = writes || p.layout.heap_buffer_writes;
         rec.barriers();
         if self.vertex_dirty {
             for (i, v) in self.vertex.iter().enumerate() {
@@ -941,6 +1120,31 @@ impl RenderPass<'_> {
         let sig = if indexed { &p.0.draw_indexed } else { &p.0.draw };
         // SAFETY: a command signature of the pipeline's root signature and arguments it reads.
         unsafe { self.enc.rec.list().ExecuteIndirect(sig, count, &scratch.0.raw, at, None, 0) };
+    }
+
+    /// Draw a batch the GPU filled (see `CommandEncoder::encode_indirect_draws`), with the
+    /// pipeline and bindings set now: `ExecuteIndirect` with the count buffer.
+    pub fn execute_indirect_draws(&mut self, draws: &crate::IndirectDraws) {
+        let src = draws.0.source.lock().clone().expect("execute_indirect_draws before encode_indirect_draws");
+        if let Some((b, offset, format)) = &src.index {
+            self.set_index_buffer(b, *offset, *format);
+        }
+        let indexed = draws.0.indexed;
+        let rec = &mut self.enc.rec;
+        rec.track.need(&draws.0.laid_out.0.track, None, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        rec.track.need(&src.count.0.track, None, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        rec.keep(draws.clone());
+        rec.keep(src.count.clone());
+        let p = self.flush(None, indexed);
+        let sig = if indexed { &p.0.draw_indexed } else { &p.0.draw };
+        // SAFETY: a command signature of the pipeline's root signature, the arguments laid out
+        // for it, and a live count buffer.
+        unsafe {
+            self.enc
+                .rec
+                .list()
+                .ExecuteIndirect(sig, draws.0.max_draws, &draws.0.laid_out.0.raw, 0, &src.count.0.raw, src.count_offset)
+        };
     }
 
     pub fn draw_indirect(&mut self, args: &Buffer, offset: u64) {
@@ -1056,10 +1260,13 @@ impl ComputePass<'_> {
         self.state.dirty = !0;
         let writes = bind_roots(rec, &r, &p.layout, &mut self.state, &p.label);
         rec.track.end_scope();
+        if p.layout.heap_buffers {
+            need_heap_buffers(rec);
+        }
         if rec.uav_dirty {
             rec.track.uav_barrier();
         }
-        rec.uav_dirty = writes;
+        rec.uav_dirty = writes || p.layout.heap_buffer_writes;
         rec.barriers();
         match groups {
             Some(g) => flush_constants(&r, &p.layout, &mut self.state, g),

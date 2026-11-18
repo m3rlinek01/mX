@@ -11,6 +11,7 @@ use crate::{BindGroup, Buffer, Device, RenderPass, RenderPipeline};
 pub(crate) enum Cmd {
     Pipeline(RenderPipeline),
     BindGroup(u32, BindGroup),
+    BufferOffset(u32, u32, u64),
     Immediates(u32, Box<[u8]>),
     VertexBuffer(u32, Buffer, u64),
     IndexBuffer(Buffer, u64, t::IndexFormat),
@@ -53,6 +54,9 @@ impl RenderBundleEncoder {
     pub fn set_immediates(&mut self, offset: u32, data: &[u8]) {
         self.cmds.push(Cmd::Immediates(offset, data.into()));
     }
+    pub fn set_buffer_offset(&mut self, group: u32, binding: u32, offset: u64) {
+        self.cmds.push(Cmd::BufferOffset(group, binding, offset));
+    }
     pub fn set_vertex_buffer(&mut self, slot: u32, b: &Buffer, offset: u64) {
         self.cmds.push(Cmd::VertexBuffer(slot, b.clone(), offset));
     }
@@ -83,6 +87,7 @@ impl RenderPass<'_> {
                 match c {
                     Cmd::Pipeline(p) => self.set_pipeline(p),
                     Cmd::BindGroup(g, bg) => self.set_bind_group(*g, bg),
+                    Cmd::BufferOffset(g, b, o) => self.set_buffer_offset(*g, *b, *o),
                     Cmd::Immediates(o, d) => self.set_immediates(*o, d),
                     Cmd::VertexBuffer(s, buf, o) => self.set_vertex_buffer(*s, buf, *o),
                     Cmd::IndexBuffer(buf, o, f) => self.set_index_buffer(buf, *o, *f),

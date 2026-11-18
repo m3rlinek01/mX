@@ -13,6 +13,7 @@ categories.workspace = true
 msl = ["naga/msl-out"]
 spirv = ["naga/spv-out"]
 hlsl = ["naga/hlsl-out"]
+glsl = ["naga/glsl-out"]
 
 [dependencies]
 naga.workspace = true

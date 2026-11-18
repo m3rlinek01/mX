@@ -25,7 +25,7 @@ pub struct ShaderModule(pub(crate) Arc<ModuleInner>);
 /// What a pipeline stage reads, for binding at draw time.
 pub(crate) struct StageInfo {
     pub layout: msl::Layout,
-    pub heap_used: u32,
+    pub heap_used: u64,
     pub uses_immediates: bool,
     pub sized_buffers: Vec<(u32, u32)>,
     /// The vertex buffers (by `set_vertex_buffer` slot) whose sizes follow `sized_buffers`'
@@ -33,10 +33,17 @@ pub(crate) struct StageInfo {
     pub vertex_buffers: Vec<u32>,
     /// Bytes of each threadgroup-memory argument (`var<workgroup>`), by index.
     pub workgroup_memory: Vec<u32>,
+    /// Heap textures and samplers bound directly at draw time (`msl::write_direct`).
+    pub direct: Vec<msl::DirectSlot>,
 }
 
 pub(crate) struct RenderPipelineInner {
     pub state: Mt<Po<dyn MTLRenderPipelineState>>,
+    /// The descriptor `state` was made from, for its variant that runs indirect command buffers.
+    desc: Mt<objc2::rc::Retained<MTLRenderPipelineDescriptor>>,
+    /// That variant, made the first time a GPU-driven batch is drawn with this pipeline (Metal
+    /// refuses it for some shaders, and a pipeline that never draws one should not fail).
+    icb: std::sync::OnceLock<std::result::Result<Mt<Po<dyn MTLRenderPipelineState>>, String>>,
     pub depth_stencil: Option<Mt<Po<dyn MTLDepthStencilState>>>,
     pub primitive: MTLPrimitiveType,
     pub cull: MTLCullMode,
@@ -50,6 +57,23 @@ pub(crate) struct RenderPipelineInner {
 
 #[derive(Clone)]
 pub struct RenderPipeline(pub(crate) Arc<RenderPipelineInner>);
+
+impl RenderPipeline {
+    /// The pipeline's variant that GPU-driven batches (indirect command buffers) draw with.
+    pub(crate) fn icb_state(&self, device: &objc2::runtime::ProtocolObject<dyn MTLDevice>) -> std::result::Result<&Po<dyn MTLRenderPipelineState>, &str> {
+        let made = self.0.icb.get_or_init(|| {
+            let d = &self.0.desc.0;
+            d.setSupportIndirectCommandBuffers(true);
+            let state = device.newRenderPipelineStateWithDescriptor_error(d).map(Mt).map_err(|e| e.localizedDescription().to_string());
+            d.setSupportIndirectCommandBuffers(false);
+            state
+        });
+        match made {
+            Ok(s) => Ok(&s.0),
+            Err(e) => Err(e.as_str()),
+        }
+    }
+}
 
 pub(crate) struct ComputePipelineInner {
     pub state: Mt<Po<dyn MTLComputePipelineState>>,
@@ -99,9 +123,32 @@ impl Device {
         vertex_buffers: &[msl::VertexBufferMapping],
     ) -> Result<(Po<dyn MTLFunction>, StageInfo, [u32; 3])> {
         let name = m.0.module.entry_point(stage, entry)?.name.clone();
-        let layout = msl::Layout::for_entry_point(&m.0.module, stage, &name)?;
         let (version, lang) = msl_version();
-        let out = msl::write(&m.0.module, &layout, stage, Some(&name), constants, version, vertex_buffers)?;
+        // (a draw's heap textures bound directly where its indices are immediates: see
+        // `msl::write_direct`; MX_METAL_DIRECT=0 keeps every access bindless. Metal 2 has no
+        // bindless: every heap access is bound so, or the pipeline cannot be made - the bound
+        // tier)
+        let bound = self.shared.bound;
+        let heap = m.0.module.entry_point_heap(stage, &name)? != 0;
+        let direct = if bound && heap {
+            match msl::write_lowered(&m.0.module, stage, Some(&name), constants, version, vertex_buffers, true)? {
+                Ok(d) => Some(d),
+                Err(why) => {
+                    return Err(Error::Unsupported(format!("{} ({stage:?} `{name}`) needs bindless (Metal 3) on this GPU: {why}", m.0.module.label)));
+                }
+            }
+        } else if stage != ShaderStage::Compute && std::env::var_os("MX_METAL_DIRECT").is_none_or(|v| v != "0") {
+            msl::write_direct(&m.0.module, stage, Some(&name), constants, version, vertex_buffers, false)?
+        } else {
+            None
+        };
+        let (out, layout, direct) = match direct {
+            Some(d) => d,
+            None => {
+                let layout = msl::Layout::for_entry_point(&m.0.module, stage, &name)?;
+                (msl::write(&m.0.module, &layout, stage, Some(&name), constants, version, vertex_buffers)?, layout, Vec::new())
+            }
+        };
         log::trace!("{} ({stage:?}) MSL:\n{}", m.0.module.label, out.source);
         let options = MTLCompileOptions::new();
         // As wgpu: the OS's MSL version, invariance kept (a depth prepass and the main pass
@@ -128,6 +175,7 @@ impl Device {
             sized_buffers: out.sized_buffers,
             vertex_buffers: Vec::new(),
             workgroup_memory: out.workgroup_memory,
+            direct,
         };
         Ok((f, info, out.workgroup_size))
     }
@@ -259,6 +307,8 @@ impl Device {
         let immediate_size = immediate_size(&desc.vertex.module.0.module).max(desc.fragment.as_ref().map_or(0, |f| immediate_size(&f.module.0.module)));
         Ok(RenderPipeline(Arc::new(RenderPipelineInner {
             state: Mt(state),
+            desc: Mt(d),
+            icb: std::sync::OnceLock::new(),
             depth_stencil,
             primitive: conv::primitive_type(desc.primitive.topology),
             cull: conv::cull(desc.primitive.cull_mode),

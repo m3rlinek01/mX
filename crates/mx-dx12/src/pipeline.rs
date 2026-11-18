@@ -61,6 +61,11 @@ pub(crate) struct Layout {
     pub signature: ID3D12RootSignature,
     pub groups: [Option<GroupTable>; 7],
     pub immediates: Option<(u32, u32)>,
+    /// The pipeline reads buffers through the heap: a command list keeps the heap's buffers
+    /// in the states shaders reach them in before its draws or dispatches.
+    pub heap_buffers: bool,
+    /// It may write them (a UAV barrier follows).
+    pub heap_buffer_writes: bool,
 }
 
 pub(crate) struct RenderPipelineInner {
@@ -123,6 +128,8 @@ fn uses_f16(m: &mx_shader::Module) -> bool {
 struct Stage {
     code: Arc<Vec<u8>>,
     roots: Vec<RootBinding>,
+    /// The buffer views of the heap it uses: (binding, read-only).
+    heap_buffers: Vec<(u32, bool)>,
 }
 
 fn bytecode(code: &[u8]) -> D3D12_SHADER_BYTECODE {
@@ -142,7 +149,18 @@ impl Device {
     fn stage(&self, m: &ShaderModule, stage: ShaderStage, entry: Option<&str>, constants: &[(&str, f64)], fragment: Option<(&ShaderModule, &str)>) -> Result<Stage> {
         let sh = &self.shared;
         let label = &m.0.module.label;
-        let out = hlsl::write(&m.0.module, stage, entry, constants, sh.shader_model, sh.views.textures, fragment.map(|(fm, n)| (&fm.0.module, n)))?;
+        let heap = hlsl::HeapSizes {
+            textures: sh.views.textures,
+            buffers: sh.views.buffers,
+        };
+        let out = hlsl::write(&m.0.module, stage, entry, constants, sh.shader_model, heap, fragment.map(|(fm, n)| (&fm.0.module, n)))?;
+        let heap_buffers =
+            m.0.module
+                .heap_buffers
+                .iter()
+                .filter(|v| out.heap_bindings_used & (1 << v.binding) != 0)
+                .map(|v| (v.binding, v.read_only))
+                .collect();
         log::trace!("{label} ({stage:?}) HLSL:\n{}", out.source);
         let key = (out.source, out.entry_point, out.profile);
         let cached = sh.shader_cache.lock().get(&key).cloned();
@@ -162,7 +180,7 @@ impl Device {
                 code
             }
         };
-        Ok(Stage { code, roots: out.roots })
+        Ok(Stage { code, roots: out.roots, heap_buffers })
     }
 
     /// Compile every entry point of `module` now (with its overrides' defaults), so shader
@@ -196,11 +214,13 @@ impl Device {
             desc.fragment.as_ref().zip(fs.as_ref()).map(|(f, (_, n))| (f.module, n.as_str())),
         )?;
         let mut roots = vs.roots.clone();
+        let mut heap_buffers = vs.heap_buffers.clone();
         if let Some((f, _)) = &fs {
             roots.extend(f.roots.iter().copied());
+            heap_buffers.extend(f.heap_buffers.iter().copied());
         }
         let imm = immediate_size(&desc.vertex.module.0.module).max(desc.fragment.as_ref().map_or(0, |f| immediate_size(&f.module.0.module)));
-        let layout = self.layout(&roots, imm, true).map_err(pipe_err)?;
+        let layout = self.layout(&roots, &heap_buffers, imm, true).map_err(pipe_err)?;
 
         if desc.vertex.buffers.len() > 8 {
             return Err(pipe_err(format!("{} vertex buffers; mX takes 8", desc.vertex.buffers.len())));
@@ -305,7 +325,7 @@ impl Device {
         let label = desc.label.unwrap_or("compute pipeline");
         let pipe_err = |message: String| Error::Pipeline { label: label.into(), message };
         let cs = self.stage(desc.module, ShaderStage::Compute, desc.entry_point, desc.constants, None)?;
-        let layout = self.layout(&cs.roots, immediate_size(&desc.module.0.module), false).map_err(pipe_err)?;
+        let layout = self.layout(&cs.roots, &cs.heap_buffers, immediate_size(&desc.module.0.module), false).map_err(pipe_err)?;
         let d = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: the signature outlives the creation call.
             pRootSignature: unsafe { crate::borrow(&layout.signature) },
@@ -324,8 +344,9 @@ impl Device {
     }
 
     /// The root signature for these root bindings (from every stage; the same binding twice is
-    /// fine, the same binding as two kinds is not).
-    fn layout(&self, roots: &[RootBinding], immediate_size: u32, graphics: bool) -> std::result::Result<Layout, String> {
+    /// fine, the same binding as two kinds is not) and heap buffer views ((binding, read-only),
+    /// from every stage).
+    fn layout(&self, roots: &[RootBinding], heap_buffers: &[(u32, bool)], immediate_size: u32, graphics: bool) -> std::result::Result<Layout, String> {
         let mut by_group: BTreeMap<u32, BTreeMap<u32, RootKind>> = BTreeMap::new();
         for r in roots {
             let g = by_group.entry(r.group).or_default();
@@ -349,9 +370,22 @@ impl Device {
             OffsetInDescriptorsFromTableStart: offset,
         };
         // (all range arrays are made before the parameters point into them)
+        // (every buffer view a stage declares is a range over the same descriptors: the raw
+        // SRVs for read-only views, the raw UAVs for written ones)
+        let mut views: Vec<(u32, bool)> = heap_buffers.to_vec();
+        views.sort_unstable();
+        views.dedup();
+        let v = &self.shared.views;
         let heap_ranges: Vec<D3D12_DESCRIPTOR_RANGE> = (0..heap::SAMPLERS)
             .map(|b| range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, t, 0, hlsl::heap_space(b), 0))
             .chain(std::iter::once(range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, mx_shader::HEAP_GROUP, hlsl::SAMPLER_INDEX_SPACE, t)))
+            .chain(views.iter().map(|&(b, read_only)| {
+                if read_only {
+                    range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, v.buffers, 0, hlsl::heap_space(b), v.buffer_srv(0))
+                } else {
+                    range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, v.buffers, 0, hlsl::heap_space(b), v.buffer_uav(0))
+                }
+            }))
             .collect();
         let n = hlsl::SAMPLER_HEAP_SIZE;
         let sampler_ranges = [
@@ -449,7 +483,13 @@ impl Device {
             self.shared.device.CreateRootSignature(0, bytes)
         }
         .map_err(|e| format!("root signature: {e}"))?;
-        Ok(Layout { signature, groups, immediates })
+        Ok(Layout {
+            signature,
+            groups,
+            immediates,
+            heap_buffers: !views.is_empty(),
+            heap_buffer_writes: views.iter().any(|&(_, read_only)| !read_only),
+        })
     }
 
     /// An indirect command signature that first sets the special constants (first vertex and

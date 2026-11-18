@@ -521,7 +521,15 @@ fn openomsi_fullscreen_passes_match_wgpu() {
     });
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
     let (wd, wq) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
-    let (md, mq) = mx::Instance::new().default_adapter().unwrap().request_device(&Default::default()).unwrap();
+    let (md, mq) = mx::Instance::with_backends(if cfg!(feature = "vulkan") {
+        mx::Backends::VULKAN
+    } else {
+        mx::Backends::PRIMARY - mx::Backends::VULKAN
+    })
+    .default_adapter()
+    .unwrap()
+    .request_device(&Default::default())
+    .unwrap();
     let (mut compared, mut failed) = (0, Vec::new());
     for name in ["post", "fsr1_srgb", "fsr1_linear", "upscale", "mip", "overlay", "lamp_sight"] {
         let path = std::path::Path::new(&dir).join(format!("{name}.wgsl"));

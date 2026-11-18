@@ -53,6 +53,20 @@ impl Buffer {
         Ok(f(bytes))
     }
 
+    /// Read the buffer's contents now, without waiting: the caller knows the submissions
+    /// that wrote it are done (`Device::is_done`), as after wgpu's `map_async`. Needs `MAP_READ`.
+    pub fn map_read_now<R>(&self, range: Range<u64>, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        assert!(self.0.usage.contains(t::BufferUsages::MAP_READ), "map_read on a buffer without MAP_READ");
+        assert!(
+            range.start <= range.end && range.end <= self.0.size,
+            "map_read range {range:?} outside the buffer ({} bytes)",
+            self.0.size
+        );
+        // SAFETY: shared storage, in range, and the GPU is idle.
+        let bytes = unsafe { std::slice::from_raw_parts(self.0.raw.contents().as_ptr().cast::<u8>().add(range.start as usize), (range.end - range.start) as usize) };
+        Ok(f(bytes))
+    }
+
     /// Write the buffer's contents from the CPU. Waits until the GPU has finished all
     /// submitted work first. Needs `MAP_WRITE`.
     pub fn map_write<R>(&self, range: Range<u64>, f: impl FnOnce(&mut [u8]) -> R) -> Result<R> {
@@ -86,6 +100,67 @@ impl Buffer {
     /// The `MTLBuffer`, for interop.
     pub fn raw(&self) -> &objc2::runtime::ProtocolObject<dyn MTLBuffer> {
         &self.0.raw
+    }
+
+    /// A range of the buffer in the bindless heap ([`BufferView::index`]). Needs `STORAGE`.
+    pub fn create_view(&self, desc: &t::BufferViewDescriptor<'_>) -> Result<BufferView> {
+        let size = desc.resolve(self.size(), self.usage(), &self.0.shared.limits);
+        let slot = self.0.shared.heap.lock().add_buffer(&self.0.raw, self.owner_id(), desc.offset, desc.writable)?;
+        Ok(BufferView(Arc::new(BufferViewInner {
+            buffer: self.clone(),
+            offset: desc.offset,
+            size,
+            writable: desc.writable,
+            slot,
+        })))
+    }
+
+    /// The identity the heap knows this buffer by.
+    pub(crate) fn owner_id(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const u8 as usize
+    }
+}
+
+pub(crate) struct BufferViewInner {
+    pub buffer: Buffer,
+    pub offset: u64,
+    pub size: u64,
+    pub writable: bool,
+    slot: u32,
+}
+
+impl Drop for BufferViewInner {
+    fn drop(&mut self) {
+        let shared = &self.buffer.0.shared;
+        shared.heap.lock().remove_buffer(self.slot, shared.release_after());
+    }
+}
+
+/// A range of a buffer in the bindless heap.
+#[derive(Clone)]
+pub struct BufferView(pub(crate) Arc<BufferViewInner>);
+
+impl BufferView {
+    /// The view's index in the heap: `mx_buffers[i]`, `mx_rw_buffers[i]` or a shader's own
+    /// buffer view in WGSL.
+    pub fn index(&self) -> u32 {
+        self.0.slot
+    }
+
+    pub fn buffer(&self) -> &Buffer {
+        &self.0.buffer
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.0.offset
+    }
+
+    pub fn size(&self) -> u64 {
+        self.0.size
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.0.writable
     }
 }
 
@@ -520,6 +595,7 @@ impl Queue {
             return Ok(());
         }
         assert!(offset + data.len() as u64 <= buffer.size(), "write_buffer past the end of the buffer");
+        self.shared.heap.lock().written(buffer.owner_id(), self.shared.release_after());
         self.shared.with_pending(|p| {
             let (staging, at) = self.shared.stage(p, data)?;
             // SAFETY: both ranges are in their buffers.
@@ -636,5 +712,135 @@ pub(crate) fn copy_buffer_texture(
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// GPU-driven draws
+
+pub(crate) struct IndirectDrawsInner {
+    pub max_draws: u32,
+    pub indexed: bool,
+    /// Draws encoded by `encode_indirect_draws`, executed by `execute_indirect_draws`; it
+    /// inherits the pipeline, the buffers and the other state from the render encoder.
+    pub icb: Mt<Po<dyn MTLIndirectCommandBuffer>>,
+    /// The argument buffer the encoding kernel reaches `icb` through (its resource ID).
+    pub container: Mt<Po<dyn MTLBuffer>>,
+    /// The index buffer of the last encoding, read through `icb`.
+    pub index: parking_lot::Mutex<Option<Buffer>>,
+}
+
+/// A batch of draws whose arguments and count the GPU writes (see `t::IndirectDrawsDescriptor`).
+#[derive(Clone)]
+pub struct IndirectDraws(pub(crate) Arc<IndirectDrawsInner>);
+
+impl IndirectDraws {
+    pub fn max_draws(&self) -> u32 {
+        self.0.max_draws
+    }
+}
+
+/// The kernels that encode GPU-driven draws (MSL: indirect command buffers are written from
+/// kernels, which WGSL has no words for).
+pub(crate) const INDIRECT_KERNELS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct DrawArgs { uint vertex_count; uint instance_count; uint first_vertex; uint first_instance; };
+struct DrawIndexedArgs { uint index_count; uint instance_count; uint first_index; int base_vertex; uint first_instance; };
+struct Icb { command_buffer cmds [[id(0)]]; };
+struct Params { uint max_draws; uint primitive; uint index_offset; uint index_u32; };
+
+kernel void mx_encode_draws(device const Icb& icb [[buffer(0)]], device const DrawArgs* args [[buffer(1)]],
+                            device const uint* count [[buffer(2)]], constant Params& p [[buffer(3)]],
+                            uint i [[thread_position_in_grid]]) {
+    if (i >= p.max_draws) { return; }
+    render_command cmd(icb.cmds, i);
+    if (i >= *count) { cmd.reset(); return; }
+    DrawArgs a = args[i];
+    cmd.draw_primitives(primitive_type(p.primitive), a.first_vertex, a.vertex_count, a.instance_count, a.first_instance);
+}
+
+kernel void mx_encode_indexed_draws(device const Icb& icb [[buffer(0)]], device const DrawIndexedArgs* args [[buffer(1)]],
+                                    device const uint* count [[buffer(2)]], constant Params& p [[buffer(3)]],
+                                    device const uchar* indices [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.max_draws) { return; }
+    render_command cmd(icb.cmds, i);
+    if (i >= *count) { cmd.reset(); return; }
+    DrawIndexedArgs a = args[i];
+    device const uchar* base = indices + p.index_offset;
+    if (p.index_u32 != 0) {
+        cmd.draw_indexed_primitives(primitive_type(p.primitive), a.index_count, (device const uint*)base + a.first_index,
+                                    a.instance_count, uint(a.base_vertex), a.first_instance);
+    } else {
+        cmd.draw_indexed_primitives(primitive_type(p.primitive), a.index_count, (device const ushort*)base + a.first_index,
+                                    a.instance_count, uint(a.base_vertex), a.first_instance);
+    }
+}
+"#;
+
+impl Device {
+    /// A batch of GPU-driven draws: an indirect command buffer of `max_draws` commands.
+    pub fn create_indirect_draws(&self, desc: &t::IndirectDrawsDescriptor<'_>) -> Result<IndirectDraws> {
+        if self.shared.bound {
+            return Err(Error::Unsupported("GPU-driven draws on a Metal 2 GPU (the bound tier)".into()));
+        }
+        let d = MTLIndirectCommandBufferDescriptor::new();
+        d.setCommandTypes(if desc.indexed { MTLIndirectCommandType::DrawIndexed } else { MTLIndirectCommandType::Draw });
+        d.setInheritPipelineState(true);
+        d.setInheritBuffers(true);
+        d.setInheritDepthStencilState(true);
+        d.setInheritDepthBias(true);
+        d.setInheritDepthClipMode(true);
+        d.setInheritCullMode(true);
+        d.setInheritFrontFacingWinding(true);
+        d.setInheritTriangleFillMode(true);
+        let n = desc.max_draws.max(1) as usize;
+        // SAFETY: a filled descriptor; the count is positive.
+        let icb = unsafe {
+            self.shared
+                .device
+                .newIndirectCommandBufferWithDescriptor_maxCommandCount_options(&d, n, MTLResourceOptions::StorageModePrivate)
+        }
+        .ok_or_else(|| Error::OutOfMemory(desc.label.unwrap_or("indirect draws").into()))?;
+        if let Some(l) = desc.label {
+            icb.setLabel(Some(&crate::ns(l)));
+        }
+        let container = self
+            .shared
+            .device
+            .newBufferWithLength_options(8, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| Error::OutOfMemory("indirect draws".into()))?;
+        // SAFETY: `MTLResourceID` is one `u64`, the layout of a `command_buffer` in a Tier 2
+        // argument buffer; the buffer is 8 bytes and unused yet.
+        unsafe { container.contents().as_ptr().cast::<MTLResourceID>().write(icb.gpuResourceID()) };
+        Ok(IndirectDraws(Arc::new(IndirectDrawsInner {
+            max_draws: desc.max_draws,
+            indexed: desc.indexed,
+            icb: Mt(icb),
+            container: Mt(container),
+            index: parking_lot::Mutex::new(None),
+        })))
+    }
+
+    pub(crate) fn indirect_kernels(&self) -> crate::device::IndirectKernels {
+        let mut k = self.shared.indirect.lock();
+        k.get_or_insert_with(|| {
+            let lib = self
+                .shared
+                .device
+                .newLibraryWithSource_options_error(&crate::ns(INDIRECT_KERNELS), None)
+                .unwrap_or_else(|e| panic!("mX's indirect draw kernels: {}", e.localizedDescription()));
+            let make = |name: &str| {
+                let f = lib.newFunctionWithName(&crate::ns(name)).expect("an indirect draw kernel");
+                Mt(self
+                    .shared
+                    .device
+                    .newComputePipelineStateWithFunction_error(&f)
+                    .unwrap_or_else(|e| panic!("mX's indirect draw kernels: {}", e.localizedDescription())))
+            };
+            [make("mx_encode_draws"), make("mx_encode_indexed_draws")]
+        })
+        .clone()
     }
 }

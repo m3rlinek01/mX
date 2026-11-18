@@ -1,5 +1,6 @@
-//! The bindless heap: argument buffers of `MTLResourceID`s, slot allocation with deferred
-//! reuse, and the residency list the encoders hand to `useResources`.
+//! The bindless heap: argument buffers of `MTLResourceID`s (textures, samplers) and of GPU
+//! addresses (buffer views), slot allocation with deferred reuse, and the residency list the
+//! encoders hand to `useResources`.
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
@@ -50,10 +51,14 @@ impl Slots {
     }
 
     fn write(&self, slot: u32, id: MTLResourceID) {
-        debug_assert!(slot < self.capacity);
         // SAFETY: `MTLResourceID` is `#[repr(C)]` around one `u64`, the layout an argument
         // buffer of `texture2d`/`sampler` entries has on Tier 2 (Metal 3) devices.
         let raw: u64 = unsafe { std::mem::transmute(id) };
+        self.write_raw(slot, raw);
+    }
+
+    fn write_raw(&self, slot: u32, raw: u64) {
+        debug_assert!(slot < self.capacity);
         // SAFETY: the slot is inside the buffer; the GPU reads only slots in use, and this one
         // is not (fresh or past its deferred release).
         unsafe { self.buffer.contents().as_ptr().cast::<u64>().add(slot as usize).write(raw) };
@@ -71,9 +76,53 @@ impl Slots {
     }
 }
 
+/// A list of resources for `useResources`.
+type ResourceList = Vec<NonNull<ProtocolObject<dyn MTLResource>>>;
+
+/// A buffer in the heap: the buffer, how many views it has there, how many of them writable.
+type HeapBuffer = (Mt<Po<dyn MTLBuffer>>, u32, u32);
+
+/// A buffer view in the heap.
+struct BufferView {
+    buffer: Mt<Po<dyn MTLBuffer>>,
+    /// Where the view starts in the buffer.
+    offset: u64,
+    /// The buffer's identity (its `Arc` address).
+    owner: usize,
+    writable: bool,
+}
+
+/// The heap's argument buffers: textures, samplers, buffers.
+pub(crate) struct Tables([Mt<Po<dyn MTLBuffer>>; 3]);
+
+impl Tables {
+    pub fn get(&self, table: mx_shader::msl::HeapTable) -> &ProtocolObject<dyn MTLBuffer> {
+        use mx_shader::msl::HeapTable as H;
+        &self.0[match table {
+            H::Textures => 0,
+            H::Samplers => 1,
+            H::Buffers => 2,
+        }]
+    }
+}
+
 pub(crate) struct Heap {
     textures: Slots,
     samplers: Slots,
+    /// The samplers by heap slot, for pipelines that bind them directly.
+    sampler_objects: HashMap<u32, Mt<Po<dyn MTLSamplerState>>>,
+    /// GPU addresses (`device T*`, naga's layout for a `binding_array` of buffers).
+    buffers: Slots,
+    buffer_views: HashMap<u32, BufferView>,
+    /// The heap's views of each buffer.
+    buffer_views_of: HashMap<usize, Vec<u32>>,
+    /// Buffers released but maybe still read by the GPU, kept alive until then.
+    retired_buffers: Vec<(u64, Mt<Po<dyn MTLBuffer>>)>,
+    /// Buffers in the heap, by owner, with how many views and how many writable ones each has
+    /// (a buffer is declared once whatever its views).
+    heap_buffers: HashMap<usize, HeapBuffer>,
+    /// Buffers copied into, declared until the submission that wrote them is done.
+    recent_buffers: Vec<(u64, Mt<Po<dyn MTLBuffer>>)>,
     /// The textures in the heap, dense, for `useResources`.
     resident: Vec<Mt<Po<dyn MTLTexture>>>,
     /// Per texture slot: its place in `resident` (`u32::MAX`: none).
@@ -99,13 +148,23 @@ pub(crate) struct Heap {
     hot: HashMap<u32, Mt<Po<dyn MTLTexture>>>,
     /// Views of textures copied into, declared until the submission that wrote them is done.
     recent: Vec<(u64, Mt<Po<dyn MTLTexture>>)>,
+    /// Resources (by owner) written by a submission not yet done: a view put in the heap after
+    /// the write (`create_buffer_init`, `write_texture`, then `create_view`) is declared too.
+    writes: HashMap<usize, u64>,
 }
 
 impl Heap {
-    pub fn new(device: &ProtocolObject<dyn MTLDevice>, textures: u32, samplers: u32) -> Result<Heap> {
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>, textures: u32, samplers: u32, buffers: u32) -> Result<Heap> {
         Ok(Heap {
             textures: Slots::new(device, textures, "mX texture heap")?,
             samplers: Slots::new(device, samplers, "mX sampler heap")?,
+            sampler_objects: HashMap::new(),
+            buffers: Slots::new(device, buffers, "mX buffer heap")?,
+            buffer_views: HashMap::new(),
+            buffer_views_of: HashMap::new(),
+            retired_buffers: Vec::new(),
+            heap_buffers: HashMap::new(),
+            recent_buffers: Vec::new(),
             resident: Vec::new(),
             dense_of: vec![u32::MAX; textures as usize],
             slot_of: Vec::new(),
@@ -117,6 +176,7 @@ impl Heap {
             views_of: HashMap::new(),
             hot: HashMap::new(),
             recent: Vec::new(),
+            writes: HashMap::new(),
         })
     }
 
@@ -137,6 +197,8 @@ impl Heap {
         self.views_of.entry(owner).or_default().push(slot);
         if hot {
             self.hot.insert(slot, Mt(tex.clone()));
+        } else if let Some(&until) = self.writes.get(&owner) {
+            self.recent.push((until, Mt(tex.clone())));
         }
         if let Some(set) = &self.set {
             set.addAllocation(ProtocolObject::from_ref(&**tex));
@@ -150,6 +212,16 @@ impl Heap {
     /// declare its views until that submission is done.
     pub fn written(&mut self, owner: usize, until: u64) {
         if self.set.is_none() {
+            return;
+        }
+        let w = self.writes.entry(owner).or_insert(until);
+        *w = (*w).max(until);
+        if let Some((buffer, _, writable)) = self.heap_buffers.get(&owner) {
+            // (writable buffers are declared by every encoder anyway)
+            if *writable == 0 {
+                self.recent_buffers.push((until, buffer.clone()));
+                self.generation += 1;
+            }
             return;
         }
         let Some(slots) = self.views_of.get(&owner) else { return };
@@ -195,19 +267,118 @@ impl Heap {
     pub fn add_sampler(&mut self, s: &Po<dyn MTLSamplerState>) -> Result<u32> {
         let slot = self.samplers.alloc("samplers")?;
         self.samplers.write(slot, s.gpuResourceID());
+        self.sampler_objects.insert(slot, Mt(s.clone()));
         Ok(slot)
     }
 
+    /// The texture view at heap `slot` (for a pipeline that binds it directly).
+    pub fn texture_at(&self, slot: u32) -> Option<&Po<dyn MTLTexture>> {
+        let dense = *self.dense_of.get(slot as usize)?;
+        self.resident.get(dense as usize).map(|t| &t.0)
+    }
+
+    /// The buffer view at heap `slot`: its buffer and where the view starts (the bound tier
+    /// binds it directly).
+    pub fn buffer_at(&self, slot: u32) -> Option<(&Po<dyn MTLBuffer>, u64)> {
+        self.buffer_views.get(&slot).map(|v| (&v.buffer.0, v.offset))
+    }
+
+    /// The sampler at heap `slot`.
+    pub fn sampler_at(&self, slot: u32) -> Option<&Po<dyn MTLSamplerState>> {
+        self.sampler_objects.get(&slot).map(|s| &s.0)
+    }
+
     pub fn remove_sampler(&mut self, slot: u32, after: u64) {
+        self.sampler_objects.remove(&slot);
         self.samplers.deferred.push((after, slot));
+    }
+
+    /// Put `size` bytes of `buffer` (identity `owner`) from `offset` in the heap.
+    /// `writable`: shaders may write them, so every encoder declares the buffer for writing.
+    pub fn add_buffer(&mut self, buffer: &Po<dyn MTLBuffer>, owner: usize, offset: u64, writable: bool) -> Result<u32> {
+        let slot = self.buffers.alloc("buffers")?;
+        self.buffers.write_raw(slot, buffer.gpuAddress() + offset);
+        self.buffer_views.insert(
+            slot,
+            BufferView {
+                buffer: Mt(buffer.clone()),
+                offset,
+                owner,
+                writable,
+            },
+        );
+        self.buffer_views_of.entry(owner).or_default().push(slot);
+        let entry = self.heap_buffers.entry(owner).or_insert_with(|| (Mt(buffer.clone()), 0, 0));
+        entry.1 += 1;
+        entry.2 += writable as u32;
+        if entry.1 == 1
+            && !writable
+            && let Some(&until) = self.writes.get(&owner)
+        {
+            self.recent_buffers.push((until, Mt(buffer.clone())));
+        }
+        if entry.1 == 1
+            && let Some(set) = &self.set
+        {
+            set.addAllocation(ProtocolObject::from_ref(&**buffer));
+            self.set_dirty = true;
+        }
+        self.generation += 1;
+        Ok(slot)
+    }
+
+    /// Take a buffer view out of the heap. Its slot is reused once submission `after` is done.
+    pub fn remove_buffer(&mut self, slot: u32, after: u64) {
+        let Some(view) = self.buffer_views.remove(&slot) else { return };
+        if let Some(v) = self.buffer_views_of.get_mut(&view.owner) {
+            v.retain(|s| *s != slot);
+            if v.is_empty() {
+                self.buffer_views_of.remove(&view.owner);
+            }
+        }
+        if let Some(entry) = self.heap_buffers.get_mut(&view.owner) {
+            entry.1 -= 1;
+            entry.2 -= view.writable as u32;
+            if entry.1 == 0 {
+                self.heap_buffers.remove(&view.owner);
+                // (out of the residency set once the GPU is done with it, in `reclaim`)
+                self.retired_buffers.push((after, view.buffer));
+            }
+        }
+        self.buffers.deferred.push((after, slot));
+        self.generation += 1;
+    }
+
+    pub fn buffers_in_use(&self) -> usize {
+        self.buffer_views.len()
     }
 
     /// Everything released before submission `completed` finished is free again.
     pub fn reclaim(&mut self, completed: u64) {
         self.textures.reclaim(completed);
         self.samplers.reclaim(completed);
+        self.buffers.reclaim(completed);
         let set = &self.set;
         let mut removed = false;
+        let heap_buffers = &self.heap_buffers;
+        self.retired_buffers.retain(|(after, buffer)| {
+            let keep = *after > completed;
+            // (a buffer that went out and came back in keeps its place in the set)
+            let back = heap_buffers.values().any(|(b, _, _)| std::ptr::eq(&***b, &***buffer));
+            if !keep
+                && !back
+                && let Some(set) = set
+            {
+                set.removeAllocation(ProtocolObject::from_ref(&***buffer));
+                removed = true;
+            }
+            keep
+        });
+        let before = self.recent_buffers.len();
+        self.recent_buffers.retain(|(until, _)| *until > completed);
+        if self.recent_buffers.len() != before {
+            self.generation += 1;
+        }
         self.retired.retain(|(after, tex)| {
             let keep = *after > completed;
             if !keep && let Some(set) = set {
@@ -217,6 +388,7 @@ impl Heap {
             keep
         });
         self.set_dirty |= removed;
+        self.writes.retain(|_, until| *until > completed);
         let before = self.recent.len();
         self.recent.retain(|(until, _)| *until > completed);
         if self.recent.len() != before {
@@ -224,32 +396,52 @@ impl Heap {
         }
     }
 
-    pub fn texture_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        &self.textures.buffer
-    }
-
-    pub fn sampler_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        &self.samplers.buffer
+    /// The three argument buffers, for binding where each pipeline wants them.
+    pub fn tables(&self) -> Option<Tables> {
+        Some(Tables([self.textures.buffer.clone(), self.samplers.buffer.clone(), self.buffers.buffer.clone()]))
     }
 
     /// Declare the heap's textures to a render encoder: with a residency set, those passes
     /// may write (and the views of `written`, textures this command buffer copied into);
     /// without, all of them.
     pub fn use_on_render(&self, enc: &ProtocolObject<dyn MTLRenderCommandEncoder>, written: &[usize]) {
-        let list = self.resource_list(written);
-        if let Some(ptr) = NonNull::new(list.as_ptr().cast_mut()) {
-            // SAFETY: `list` holds valid resources kept alive by `self.resident` (the caller
-            // holds the heap lock).
-            unsafe { enc.useResources_count_usage_stages(ptr, list.len(), MTLResourceUsage::Read, MTLRenderStages::Vertex | MTLRenderStages::Fragment) };
+        let stages = MTLRenderStages::Vertex | MTLRenderStages::Fragment;
+        let (read, write) = self.resource_lists(written);
+        for (list, usage) in [(read, MTLResourceUsage::Read), (write, MTLResourceUsage::Read | MTLResourceUsage::Write)] {
+            if let Some(ptr) = NonNull::new(list.as_ptr().cast_mut()) {
+                // SAFETY: `list` holds valid resources kept alive by the heap (the caller
+                // holds the heap lock).
+                unsafe { enc.useResources_count_usage_stages(ptr, list.len(), usage, stages) };
+            }
         }
     }
 
     pub fn use_on_compute(&self, enc: &ProtocolObject<dyn MTLComputeCommandEncoder>, written: &[usize]) {
-        let list = self.resource_list(written);
-        if let Some(ptr) = NonNull::new(list.as_ptr().cast_mut()) {
-            // SAFETY: as in `use_on_render`.
-            unsafe { enc.useResources_count_usage(ptr, list.len(), MTLResourceUsage::Read) };
+        let (read, write) = self.resource_lists(written);
+        for (list, usage) in [(read, MTLResourceUsage::Read), (write, MTLResourceUsage::Read | MTLResourceUsage::Write)] {
+            if let Some(ptr) = NonNull::new(list.as_ptr().cast_mut()) {
+                // SAFETY: as in `use_on_render`.
+                unsafe { enc.useResources_count_usage(ptr, list.len(), usage) };
+            }
         }
+    }
+
+    /// What an encoder declares: resources it reads, and buffers shaders may write.
+    fn resource_lists(&self, written: &[usize]) -> (ResourceList, ResourceList) {
+        let buf = |b: &Mt<Po<dyn MTLBuffer>>| NonNull::from(ProtocolObject::<dyn MTLResource>::from_ref(&*b.0));
+        let mut read = self.resource_list(written);
+        let mut write = Vec::new();
+        for (owner, (b, _, writable)) in &self.heap_buffers {
+            if *writable > 0 {
+                write.push(buf(b));
+            } else if self.set.is_none() || written.contains(owner) {
+                read.push(buf(b));
+            }
+        }
+        if self.set.is_some() {
+            read.extend(self.recent_buffers.iter().map(|(_, b)| buf(b)));
+        }
+        (read, write)
     }
 
     fn resource_list(&self, written: &[usize]) -> Vec<NonNull<ProtocolObject<dyn MTLResource>>> {

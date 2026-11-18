@@ -493,8 +493,7 @@ fn shader_errors_are_reported_not_panics() {
             label: Some("bad"),
             source: "fn f() -> u32 { return 1.5; }",
         })
-        .err()
-        .expect("an error");
+        .expect_err("an error");
     assert!(e.to_string().contains("bad"), "{e}");
 }
 
@@ -561,6 +560,74 @@ fn indirect_draws_read_their_arguments_from_the_gpu() {
         rp.draw_indexed_indirect(&iargs, 0);
     }
     assert_eq!(stripes(&g.read(enc, &t)), [64, 0, 191, 255]);
+}
+
+#[test]
+fn draws_read_one_uniform_buffer_at_their_own_offsets() {
+    let g = gpu();
+    let m = g.shader(&format!(
+        "{FULLSCREEN_VS}
+struct Tint {{ c: vec4<f32> }}
+@group(0) @binding(0) var<uniform> tint: Tint;
+@fragment fn fs(i: Out) -> @location(0) vec4<f32> {{ return tint.c; }}"
+    ));
+    let p = g.pipeline(&m, TextureFormat::Rgba8Unorm, &[], None, &[]);
+    // red at 0, green at 256, blue at 512 (one row of 256 bytes each)
+    let mut rows = vec![0f32; 3 * 64];
+    for (k, c) in [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]].iter().enumerate() {
+        rows[k * 64..k * 64 + 4].copy_from_slice(c);
+    }
+    let buf = g
+        .device
+        .create_buffer_init(&BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&rows),
+            usage: BufferUsages::UNIFORM,
+        })
+        .unwrap();
+    let group = g.device.create_bind_group(&BindGroupDescriptor {
+        label: None,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: BindingResource::Buffer(BufferBinding {
+                buffer: &buf,
+                offset: 0,
+                size: Some(16),
+            }),
+        }],
+    });
+    // the right half drawn from a bundle: its offset is its own
+    let mut be = g.device.create_render_bundle_encoder(&RenderBundleEncoderDescriptor {
+        label: None,
+        color_formats: &[Some(TextureFormat::Rgba8Unorm)],
+        depth_stencil: None,
+        sample_count: 1,
+    });
+    be.set_pipeline(&p);
+    be.set_bind_group(0, &group);
+    be.set_buffer_offset(0, 0, 512);
+    be.draw(0..3, 0..1);
+    let bundle = be.finish(None);
+    let (t, v) = g.target(TextureFormat::Rgba8Unorm);
+    let mut enc = g.device.create_command_encoder(None);
+    {
+        let mut rp = pass(&mut enc, &v, Color::BLACK);
+        rp.set_pipeline(&p);
+        rp.set_bind_group(0, &group);
+        rp.set_scissor_rect(0, 0, W / 2, H);
+        rp.set_buffer_offset(0, 0, 256);
+        rp.draw(0..3, 0..1);
+        // (set again: back to the group's own offset)
+        rp.set_scissor_rect(0, 0, W / 4, H);
+        rp.set_bind_group(0, &group);
+        rp.draw(0..3, 0..1);
+        rp.set_scissor_rect(W / 2, 0, W / 2, H);
+        rp.execute_bundles([&bundle]);
+    }
+    let px = g.read(enc, &t);
+    assert_eq!(px[0], [255, 0, 0, 255], "the group's own offset");
+    assert_eq!(px[(W / 2 - 1) as usize], [0, 255, 0, 255], "the pass's offset");
+    assert_eq!(px[(W - 1) as usize], [0, 0, 255, 255], "the bundle's offset");
 }
 
 #[test]
@@ -1707,5 +1774,274 @@ var<immediate> draw: Draw;
         }
         let px = g.read(enc, &t);
         assert!(px.iter().all(|p| *p == c), "frame {frame}: {:?}, want {c:?}", px[0]);
+    }
+}
+
+fn heap_buffer(g: &Gpu, data: &[u8], usage: BufferUsages) -> Buffer {
+    buffer(g, data, usage | BufferUsages::STORAGE)
+}
+
+#[test]
+fn buffers_in_the_heap_need_no_bind_groups() {
+    let g = gpu();
+    // a typed read-only view at an offset, the words of a writable view, chosen by immediates
+    let m = g.shader(
+        "struct Item { a: u32, b: u32 }
+struct Items { items: array<Item> }
+@group(7) @binding(16) var<storage, read> items: binding_array<Items>;
+struct Draw { src: u32, dst: u32, n: u32 }
+var<immediate> draw: Draw;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x < draw.n) {
+        let it = items[draw.src].items[id.x];
+        mx_rw_buffers[draw.dst].w[id.x] = it.a * 10u + it.b + mx_buffers[draw.src].w[0];
+    }
+}",
+    );
+    let p = g
+        .device
+        .create_compute_pipeline(&ComputePipelineDescriptor {
+            label: None,
+            module: &m,
+            entry_point: None,
+            constants: &[],
+        })
+        .unwrap();
+    let n = 100u32;
+    let align = g.device.limits().buffer_view_offset_alignment as usize;
+    let mut words = vec![0u32; align / 4];
+    words.extend((0..n).flat_map(|i| [i, i % 7]));
+    let src = heap_buffer(&g, bytemuck::cast_slice(&words), BufferUsages::empty());
+    let src_view = src
+        .create_view(&BufferViewDescriptor {
+            offset: align as u64,
+            ..Default::default()
+        })
+        .unwrap();
+    let dst = g
+        .device
+        .create_buffer(&BufferDescriptor {
+            label: None,
+            size: n as u64 * 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        })
+        .unwrap();
+    let dst_view = dst.create_view(&BufferViewDescriptor { writable: true, ..Default::default() }).unwrap();
+    assert_ne!(src_view.index(), dst_view.index());
+    assert_eq!(g.device.bindless_buffers_in_use(), 2);
+    let rb = g
+        .device
+        .create_buffer(&BufferDescriptor {
+            label: None,
+            size: n as u64 * 4,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        })
+        .unwrap();
+    let mut enc = g.device.create_command_encoder(None);
+    {
+        let mut cp = enc.begin_compute_pass(&Default::default());
+        cp.set_pipeline(&p);
+        cp.set_immediates(0, bytemuck::cast_slice(&[src_view.index(), dst_view.index(), n]));
+        cp.dispatch_workgroups(n.div_ceil(64), 1, 1);
+    }
+    enc.copy_buffer_to_buffer(&dst, 0, &rb, 0, n as u64 * 4);
+    let i = g.queue.submit([enc.finish()]);
+    g.device.wait(i).unwrap();
+    let out: Vec<u32> = rb.map_read(0..rb.size(), |b| bytemuck::cast_slice(b).to_vec()).unwrap();
+    // (`mx_buffers[src].w[0]` is the view's first word: item 0's `a`, which is 0)
+    let want: Vec<u32> = (0..n).map(|i| i * 10 + i % 7).collect();
+    assert_eq!(out, want);
+}
+
+#[test]
+fn fragments_read_heap_buffers_chosen_by_immediates() {
+    let g = gpu();
+    let red = heap_buffer(&g, bytemuck::cast_slice(&[1.0f32, 0.0, 0.0, 1.0]), BufferUsages::empty());
+    let green = heap_buffer(&g, bytemuck::cast_slice(&[0.0f32, 1.0, 0.0, 1.0]), BufferUsages::empty());
+    let (red, green) = (red.create_view(&Default::default()).unwrap(), green.create_view(&Default::default()).unwrap());
+    let m = g.shader(&format!(
+        "{FULLSCREEN_VS}
+struct Colour {{ c: vec4<f32> }}
+@group(7) @binding(20) var<storage, read> colours: binding_array<Colour>;
+struct Draw {{ colour: u32 }}
+var<immediate> draw: Draw;
+@fragment fn fs(i: Out) -> @location(0) vec4<f32> {{ return colours[draw.colour].c; }}"
+    ));
+    let p = g.pipeline(&m, TextureFormat::Rgba8Unorm, &[], None, &[]);
+    let (t, v) = g.target(TextureFormat::Rgba8Unorm);
+    let mut enc = g.device.create_command_encoder(None);
+    {
+        let mut rp = pass(&mut enc, &v, Color::BLACK);
+        rp.set_pipeline(&p);
+        for (x, view) in [(0, &red), (W / 2, &green)] {
+            rp.set_scissor_rect(x, 0, W / 2, H);
+            rp.set_immediates(0, bytemuck::cast_slice(&[view.index()]));
+            rp.draw(0..3, 0..1);
+        }
+    }
+    let px = g.read(enc, &t);
+    assert_eq!(px[0], [255, 0, 0, 255]);
+    assert_eq!(px[(W - 1) as usize], [0, 255, 0, 255]);
+}
+
+#[test]
+fn heap_buffers_see_writes_of_earlier_passes_and_copies() {
+    let g = gpu();
+    // pass 1 writes through the heap, a copy overwrites part of it, pass 2 reads both
+    let fill = g.shader(
+        "struct Draw { dst: u32 }
+var<immediate> draw: Draw;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) { mx_rw_buffers[draw.dst].w[id.x] = id.x + 1u; }",
+    );
+    let sum = g.shader(
+        "struct Draw { src: u32, dst: u32 }
+var<immediate> draw: Draw;
+@compute @workgroup_size(1) fn main() {
+    var s = 0u;
+    for (var i = 0u; i < 64u; i++) { s += mx_buffers[draw.src].w[i]; }
+    mx_rw_buffers[draw.dst].w[0] = s;
+}",
+    );
+    let pipe = |m| {
+        g.device
+            .create_compute_pipeline(&ComputePipelineDescriptor {
+                label: None,
+                module: m,
+                entry_point: None,
+                constants: &[],
+            })
+            .unwrap()
+    };
+    let (fill, sum) = (pipe(&fill), pipe(&sum));
+    let data = g
+        .device
+        .create_buffer(&BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        })
+        .unwrap();
+    let out = g
+        .device
+        .create_buffer(&BufferDescriptor {
+            label: None,
+            size: 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        })
+        .unwrap();
+    let rw = |b: &Buffer| b.create_view(&BufferViewDescriptor { writable: true, ..Default::default() }).unwrap();
+    let (data_view, out_view) = (rw(&data), rw(&out));
+    let twos = buffer(&g, bytemuck::cast_slice(&[2u32; 8]), BufferUsages::COPY_SRC);
+    let rb = g
+        .device
+        .create_buffer(&BufferDescriptor {
+            label: None,
+            size: 4,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        })
+        .unwrap();
+    let mut enc = g.device.create_command_encoder(None);
+    {
+        let mut cp = enc.begin_compute_pass(&Default::default());
+        cp.set_pipeline(&fill);
+        cp.set_immediates(0, bytemuck::cast_slice(&[data_view.index()]));
+        cp.dispatch_workgroups(1, 1, 1);
+    }
+    enc.copy_buffer_to_buffer(&twos, 0, &data, 0, 32);
+    {
+        let mut cp = enc.begin_compute_pass(&Default::default());
+        cp.set_pipeline(&sum);
+        cp.set_immediates(0, bytemuck::cast_slice(&[data_view.index(), out_view.index()]));
+        cp.dispatch_workgroups(1, 1, 1);
+    }
+    enc.copy_buffer_to_buffer(&out, 0, &rb, 0, 4);
+    let i = g.queue.submit([enc.finish()]);
+    g.device.wait(i).unwrap();
+    let got: u32 = rb.map_read(0..4, |b| bytemuck::cast_slice::<u8, u32>(b)[0]).unwrap();
+    // 1..=64, with the first 8 replaced by 2
+    assert_eq!(got, (9..=64).sum::<u32>() + 8 * 2);
+}
+
+#[test]
+fn buffer_heap_slots_are_reused_only_after_the_gpu_is_done() {
+    let g = gpu();
+    let b = heap_buffer(&g, &[0; 16], BufferUsages::empty());
+    let first = b.create_view(&Default::default()).unwrap();
+    let slot = first.index();
+    drop(first);
+    let second = b.create_view(&Default::default()).unwrap();
+    assert_ne!(second.index(), slot);
+    let i = g.queue.submit([]);
+    g.device.wait(i).unwrap();
+    let third = b.create_view(&Default::default()).unwrap();
+    assert_eq!(third.index(), slot, "a slot freed before a finished submission is reused");
+}
+
+#[test]
+fn gpu_driven_draws_stop_at_the_gpus_count() {
+    let g = gpu();
+    if !Instance::new().default_adapter().unwrap().supports_indirect_count() {
+        eprintln!("no GPU-driven draw counts on this device; skipped");
+        return;
+    }
+    // instance i fills the i-th quarter of the target; 4 draws in the batch, the count says 3
+    let m = g.shader(
+        "struct Out { @builtin(position) pos: vec4<f32> }
+@vertex fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Out {
+    let corner = vec2<f32>(f32((v + 1u) % 6u / 3u), f32(v % 2u));
+    let x = (f32(i) + corner.x) * 0.5 - 1.0;
+    return Out(vec4<f32>(x, corner.y * 2.0 - 1.0, 0.0, 1.0));
+}
+@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }",
+    );
+    let p = g.pipeline(&m, TextureFormat::Rgba8Unorm, &[], None, &[]);
+    for indexed in [false, true] {
+        let (t, v) = g.target(TextureFormat::Rgba8Unorm);
+        let usage = BufferUsages::STORAGE | BufferUsages::INDIRECT;
+        let (args, index) = if indexed {
+            let a: Vec<DrawIndexedIndirectArgs> = (0..4)
+                .map(|i| DrawIndexedIndirectArgs {
+                    index_count: 6,
+                    instance_count: 1,
+                    first_index: 0,
+                    base_vertex: 0,
+                    first_instance: i,
+                })
+                .collect();
+            (
+                buffer(&g, bytemuck::cast_slice(&a), usage),
+                Some(buffer(&g, bytemuck::cast_slice(&[0u16, 1, 2, 3, 4, 5]), BufferUsages::INDEX)),
+            )
+        } else {
+            let a: Vec<DrawIndirectArgs> = (0..4)
+                .map(|i| DrawIndirectArgs {
+                    vertex_count: 6,
+                    instance_count: 1,
+                    first_vertex: 0,
+                    first_instance: i,
+                })
+                .collect();
+            (buffer(&g, bytemuck::cast_slice(&a), usage), None)
+        };
+        let count = buffer(&g, bytemuck::cast_slice(&[3u32]), BufferUsages::INDIRECT);
+        let draws = g
+            .device
+            .create_indirect_draws(&IndirectDrawsDescriptor {
+                label: Some("batch"),
+                max_draws: 4,
+                indexed,
+            })
+            .unwrap();
+        let mut enc = g.device.create_command_encoder(None);
+        enc.encode_indirect_draws(&draws, &p, &args, 0, &count, 0, index.as_ref().map(|b| (b, 0, IndexFormat::Uint16)));
+        {
+            let mut rp = pass(&mut enc, &v, Color::BLACK);
+            rp.set_pipeline(&p);
+            rp.execute_indirect_draws(&draws);
+        }
+        let px = g.read(enc, &t);
+        let row = (H / 2 * W) as usize;
+        let quarter = |q: u32| px[row + (q * W / 4 + W / 8) as usize][0];
+        assert_eq!([quarter(0), quarter(1), quarter(2), quarter(3)], [255, 255, 255, 0], "indexed: {indexed}");
     }
 }

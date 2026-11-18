@@ -2,13 +2,14 @@
 //!
 //! | buffer slot | use |
 //! |-------------|-----|
-//! | 0..=7       | heap bindings (`heap::*`), each an argument buffer of `MTLResourceID`s |
-//! | 8           | immediates |
-//! | 9           | sizes of runtime-sized storage buffers, then of the vertex buffers |
-//! | 10..=22     | root buffers, in (group, binding) order |
+//! | 0           | immediates |
+//! | 1           | sizes of runtime-sized root storage buffers, then of the vertex buffers |
+//! | 2..=22      | the heap bindings the entry point uses, in binding order, each an argument buffer of `MTLResourceID`s (textures, samplers) or of GPU addresses (buffers); then its root buffers, in (group, binding) order |
 //! | 23..=30     | vertex buffers, `30 - index` |
 //!
 //! Root textures and samplers take texture / sampler slots from 0 in (group, binding) order.
+//! Each entry point gets its own assignment and counts only what it uses, so a shader that
+//! reads `mx_tex2d`, `mx_samplers` and two buffer views has 17 slots left for root buffers.
 
 use std::collections::BTreeMap;
 
@@ -18,9 +19,12 @@ use naga::back::msl;
 pub use msl::{AttributeMapping, VertexBufferMapping, VertexBufferStepMode};
 pub use naga_types::VertexFormat;
 
-pub const IMMEDIATES_SLOT: u32 = 8;
-pub const SIZES_SLOT: u32 = 9;
-pub const FIRST_ROOT_BUFFER_SLOT: u32 = 10;
+pub const IMMEDIATES_SLOT: u32 = 0;
+pub const SIZES_SLOT: u32 = 1;
+/// The first slot of the heap bindings, then the root buffers.
+pub const FIRST_HEAP_SLOT: u32 = 2;
+/// The slots heap bindings and root buffers share.
+pub const SHARED_SLOTS: u32 = 21;
 pub const MAX_ROOT_BUFFERS: u32 = 13;
 pub const MAX_VERTEX_BUFFERS: u32 = 8;
 pub const MAX_ROOT_TEXTURES: u32 = 96;
@@ -43,36 +47,73 @@ pub enum RootSlot {
     AccelerationStructure(u32),
 }
 
-/// The Metal slots of every root binding of a module.
+/// What a heap binding's argument buffer holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HeapTable {
+    Textures,
+    Samplers,
+    Buffers,
+}
+
+impl HeapTable {
+    pub const fn of(binding: u32) -> HeapTable {
+        if heap::is_texture(binding) {
+            HeapTable::Textures
+        } else if heap::is_sampler(binding) {
+            HeapTable::Samplers
+        } else {
+            HeapTable::Buffers
+        }
+    }
+}
+
+/// The Metal slots of the heap bindings and root bindings of a module or an entry point.
 #[derive(Clone, Debug, Default)]
 pub struct Layout {
+    /// Heap binding -> buffer slot.
+    pub heap: BTreeMap<u32, u32>,
     pub roots: BTreeMap<(u32, u32), RootSlot>,
 }
 
 impl Layout {
-    /// Slots for every root binding of the module.
+    /// Slots for every heap and root binding of the module.
     pub fn for_module(m: &Module) -> Result<Layout, ShaderError> {
-        Self::assign(m, m.roots.iter())
+        let heap = (0..m.module.entry_points.len()).fold(0, |bits, i| {
+            let info = m.info.get_entry_point(i);
+            bits | crate::heap_used(&m.module, |h| !info[h].is_empty())
+        });
+        Self::assign(m, heap, m.roots.iter())
     }
 
-    /// Slots for the root bindings one entry point uses. As in wgpu, Metal's limits count
-    /// what the entry point reads, not everything its module declares (openOMSI's motion
-    /// vectors share the scene module, which declares more buffers than one stage takes).
+    /// Slots for what one entry point uses. As in wgpu, Metal's limits count what the entry
+    /// point reads, not everything its module declares (openOMSI's motion vectors share the
+    /// scene module, which declares more buffers than one stage takes).
     pub fn for_entry_point(m: &Module, stage: naga::ShaderStage, name: &str) -> Result<Layout, ShaderError> {
-        Self::assign(m, m.entry_point_roots(stage, name)?.iter())
+        Self::assign(m, m.entry_point_heap(stage, name)?, m.entry_point_roots(stage, name)?.iter())
     }
 
-    fn assign<'a>(m: &Module, list: impl Iterator<Item = &'a crate::RootBinding>) -> Result<Layout, ShaderError> {
+    /// The (slot, table) pairs a pipeline binds for its heap.
+    pub fn heap_tables(&self) -> impl Iterator<Item = (u32, HeapTable)> + '_ {
+        self.heap.iter().map(|(&b, &slot)| (slot, HeapTable::of(b)))
+    }
+
+    fn assign<'a>(m: &Module, heap_bits: u64, list: impl Iterator<Item = &'a crate::RootBinding>) -> Result<Layout, ShaderError> {
+        let mut heap = BTreeMap::new();
+        let mut next = FIRST_HEAP_SLOT;
+        for b in 0..64 {
+            if heap_bits & (1 << b) != 0 {
+                heap.insert(b, next);
+                next += 1;
+            }
+        }
+        let heap_slots = next - FIRST_HEAP_SLOT;
         let (mut b, mut t, mut s) = (0, 0, 0);
         let mut roots = BTreeMap::new();
         for r in list {
             let slot = match r.kind {
                 RootKind::UniformBuffer | RootKind::StorageBuffer { .. } => {
                     b += 1;
-                    RootSlot::Buffer {
-                        slot: FIRST_ROOT_BUFFER_SLOT + b - 1,
-                        kind: r.kind,
-                    }
+                    RootSlot::Buffer { slot: next + b - 1, kind: r.kind }
                 }
                 RootKind::Texture | RootKind::StorageTexture => {
                     t += 1;
@@ -84,24 +125,23 @@ impl Layout {
                 }
                 RootKind::AccelerationStructure => {
                     b += 1;
-                    RootSlot::AccelerationStructure(FIRST_ROOT_BUFFER_SLOT + b - 1)
+                    RootSlot::AccelerationStructure(next + b - 1)
                 }
             };
             roots.insert((r.group, r.binding), slot);
         }
-        let over = |n: u32, max: u32, what: &str| {
-            (n > max).then(|| ShaderError::Layout {
-                label: m.label.clone(),
-                message: format!("{n} root {what}; Metal takes {max}"),
-            })
-        };
+        let err = |message: String| ShaderError::Layout { label: m.label.clone(), message };
+        let over = |n: u32, max: u32, what: &str| (n > max).then(|| err(format!("{n} root {what}; Metal takes {max}")));
         if let Some(e) = over(b, MAX_ROOT_BUFFERS, "buffers")
             .or(over(t, MAX_ROOT_TEXTURES, "textures"))
             .or(over(s, MAX_ROOT_SAMPLERS, "samplers"))
         {
             return Err(e);
         }
-        Ok(Layout { roots })
+        if heap_slots + b > SHARED_SLOTS {
+            return Err(err(format!("{heap_slots} heap bindings and {b} root buffers; Metal has {SHARED_SLOTS} buffer slots for both")));
+        }
+        Ok(Layout { heap, roots })
     }
 }
 
@@ -111,11 +151,12 @@ pub struct Output {
     pub source: String,
     /// The function's name in `source` (naga renames names MSL reserves).
     pub entry_point: String,
-    /// Which heap bindings the entry point reads (bit per `heap::*`).
-    pub heap_bindings_used: u32,
+    /// Which heap bindings the entry point reads (bit per `heap::*` and buffer view).
+    pub heap_bindings_used: u64,
     pub uses_immediates: bool,
     /// The root buffers whose byte sizes go to `SIZES_SLOT`, as consecutive `u32`s in this
-    /// order (naga's: the order of declaration among the globals this entry point keeps).
+    /// order (naga's: the order of declaration among the globals this entry point keeps). A
+    /// heap buffer view in the list (group `HEAP_GROUP`) takes a `u32` that nothing reads.
     pub sized_buffers: Vec<(u32, u32)>,
     pub workgroup_size: [u32; 3],
     /// Bytes of each `var<workgroup>` the entry point uses, in threadgroup-memory index
@@ -139,6 +180,118 @@ pub fn write(
 ) -> Result<Output, ShaderError> {
     let name = m.entry_point(stage, entry)?.name.clone();
     let (module, info) = m.specialize(stage, &name, constants)?;
+    emit(m, layout, stage, &name, &module, &info, version, vertex_buffers)
+}
+
+/// A heap texture or sampler the direct form binds itself (`write_direct`): the slot, and the
+/// texture or sampler slot it takes in Metal's argument tables.
+#[derive(Clone, Copy, Debug)]
+pub struct DirectSlot {
+    pub slot: crate::bound::Slot,
+    pub root: RootSlot,
+}
+
+/// One entry point in MSL with its heap accesses bound directly: where every heap texture and
+/// sampler it reads is indexed by an immediate (or a constant) - a material's textures - each
+/// becomes a plain texture or sampler argument the backend binds at draw time, from the
+/// immediates, instead of an index into the heap's argument buffer. Apple's GPUs read a texture
+/// argument directly; through the argument buffer each sample loads its descriptor first (the
+/// scene's main pass took an eighth longer). None where the entry point needs real bindless
+/// (an index read from memory) or reads the buffer heap: the bindless form (`write`) then.
+#[allow(clippy::too_many_arguments)]
+pub fn write_direct(
+    m: &Module,
+    stage: naga::ShaderStage,
+    entry: Option<&str>,
+    constants: &[(&str, f64)],
+    version: (u8, u8),
+    vertex_buffers: &[VertexBufferMapping],
+    buffers: bool,
+) -> Result<Option<Direct>, ShaderError> {
+    write_lowered(m, stage, entry, constants, version, vertex_buffers, buffers).map(|r| r.ok())
+}
+
+/// An entry point written in the direct form: its source, layout and the heap slots it binds.
+pub type Direct = (Output, Layout, Vec<DirectSlot>);
+
+/// [`write_direct`], with why an entry point cannot be written so (Metal 2, where there is no
+/// other way: the bound tier).
+#[allow(clippy::too_many_arguments)]
+pub fn write_lowered(
+    m: &Module,
+    stage: naga::ShaderStage,
+    entry: Option<&str>,
+    constants: &[(&str, f64)],
+    version: (u8, u8),
+    vertex_buffers: &[VertexBufferMapping],
+    buffers: bool,
+) -> Result<Result<Direct, String>, ShaderError> {
+    let name = m.entry_point(stage, entry)?.name.clone();
+    if m.entry_point_heap(stage, &name)? == 0 {
+        return Ok(Err("it reads no heap".into()));
+    }
+    let (module, _) = m.specialize(stage, &name, constants)?;
+    let lowered = match crate::bound::lower(m, module, stage, &name) {
+        Ok(l) => l,
+        Err(e) => return Ok(Err(e.to_string())),
+    };
+    if !buffers && lowered.slots.iter().any(|s| heap::is_buffer(s.heap_binding)) {
+        return Ok(Err("it reads heap buffers".into()));
+    }
+    let mut layout = Layout::for_entry_point(m, stage, &name)?;
+    layout.heap.clear();
+    let mut textures = layout.roots.values().filter(|r| matches!(r, RootSlot::Texture(_))).count() as u32;
+    let mut samplers = layout.roots.values().filter(|r| matches!(r, RootSlot::Sampler(_))).count() as u32;
+    // (buffer slots after the root buffers'; the heap's own slots are not used)
+    let mut next_buffer = layout
+        .roots
+        .values()
+        .filter_map(|r| match r {
+            RootSlot::Buffer { slot, .. } | RootSlot::AccelerationStructure(slot) => Some(*slot + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(FIRST_HEAP_SLOT);
+    let mut direct = Vec::with_capacity(lowered.slots.len());
+    for slot in &lowered.slots {
+        let root = if heap::is_sampler(slot.heap_binding) {
+            samplers += 1;
+            RootSlot::Sampler(samplers - 1)
+        } else if heap::is_buffer(slot.heap_binding) {
+            next_buffer += 1;
+            RootSlot::Buffer {
+                slot: next_buffer - 1,
+                kind: RootKind::StorageBuffer { read_only: false },
+            }
+        } else {
+            textures += 1;
+            RootSlot::Texture(textures - 1)
+        };
+        layout.roots.insert((HEAP_GROUP, slot.binding), root);
+        direct.push(DirectSlot { slot: *slot, root });
+    }
+    if textures > MAX_ROOT_TEXTURES || samplers > MAX_ROOT_SAMPLERS {
+        return Ok(Err(format!("{textures} textures and {samplers} samplers; Metal binds {MAX_ROOT_TEXTURES} and {MAX_ROOT_SAMPLERS}")));
+    }
+    if next_buffer > FIRST_HEAP_SLOT + SHARED_SLOTS {
+        return Ok(Err(format!("{} buffers; Metal has {SHARED_SLOTS} buffer slots", next_buffer - FIRST_HEAP_SLOT)));
+    }
+    let out = emit(m, &layout, stage, &name, &lowered.module, &lowered.info, version, vertex_buffers)?;
+    Ok(Ok((out, layout, direct)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit(
+    m: &Module,
+    layout: &Layout,
+    stage: naga::ShaderStage,
+    name: &str,
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+    version: (u8, u8),
+    vertex_buffers: &[VertexBufferMapping],
+) -> Result<Output, ShaderError> {
+    let name = name.to_string();
     let backend_err = |message: String| ShaderError::Backend {
         label: m.label.clone(),
         target: "MSL",
@@ -146,9 +299,11 @@ pub fn write(
     };
 
     let mut resources = BTreeMap::new();
-    for b in 0..heap::COUNT {
+    for (&b, &slot) in &layout.heap {
         let target = msl::BindTarget {
-            buffer: Some(b as u8),
+            buffer: Some(slot as u8),
+            // (a view of the buffer heap may be written)
+            mutable: heap::is_buffer(b),
             ..Default::default()
         };
         resources.insert(naga::ResourceBinding { group: HEAP_GROUP, binding: b }, target);
@@ -179,7 +334,7 @@ pub fn write(
 
     let mut options = msl::Options {
         lang_version: version,
-        bounds_check_policies: crate::bounds_check_policies(),
+        bounds_check_policies: m.bounds_check_policies(),
         zero_initialize_workgroup_memory: true,
         force_loop_bounding: true,
         fake_missing_bindings: false,
@@ -193,7 +348,7 @@ pub fn write(
         vertex_buffer_mappings: vertex_buffers.to_vec(),
         ..Default::default()
     };
-    let (source, tinfo) = msl::write_string(&module, &info, &options, &pipeline).map_err(|e| backend_err(e.to_string()))?;
+    let (source, tinfo) = msl::write_string(module, info, &options, &pipeline).map_err(|e| backend_err(e.to_string()))?;
 
     let (ep_index, ep) = module
         .entry_points
@@ -217,27 +372,16 @@ pub fn write(
         .filter(|(h, v)| v.space == naga::AddressSpace::WorkGroup && !ep_info[*h].is_empty())
         .map(|(_, v)| layouter[v.ty].size)
         .collect();
-    let mut heap_bindings_used = 0;
-    let mut uses_immediates = false;
+    let heap_bindings_used = crate::heap_used(module, |h| !ep_info[h].is_empty());
+    let uses_immediates = module.global_variables.iter().any(|(h, v)| v.space == naga::AddressSpace::Immediate && !ep_info[h].is_empty());
+    // (a heap buffer view takes one `u32` here too, which nothing reads: heap buffers are
+    // unchecked and `arrayLength` of them is refused, see `Module::bounds_check_policies`)
     let sized_buffers = module
         .global_variables
         .iter()
         .filter(|(_, v)| module.types[v.ty].inner.needs_host_buffer_byte_size(&module.types))
         .filter_map(|(_, v)| v.binding.map(|b| (b.group, b.binding)))
         .collect();
-    for (h, var) in module.global_variables.iter() {
-        if ep_info[h].is_empty() {
-            continue;
-        }
-        if var.space == naga::AddressSpace::Immediate {
-            uses_immediates = true;
-        }
-        if let Some(rb) = var.binding
-            && rb.group == HEAP_GROUP
-        {
-            heap_bindings_used |= 1 << rb.binding;
-        }
-    }
     Ok(Output {
         source,
         entry_point,
@@ -262,13 +406,39 @@ mod tests {
         .unwrap();
         let layout = Layout::for_module(&m).unwrap();
         let out = write(&m, &layout, naga::ShaderStage::Fragment, None, &[], (3, 0), &[]).unwrap();
-        assert!(out.source.contains("[[buffer(0)]]"), "{}", out.source);
-        assert!(out.source.contains("[[buffer(6)]]"));
-        assert!(out.source.contains("[[buffer(8)]]"));
-        assert!(out.source.contains("[[buffer(10)]]"));
-        assert!(out.source.contains("[[buffer(11)]]"));
+        // immediates 0, sizes 1, mx_tex2d 2, mx_samplers 3, then the roots
+        for slot in 0..=5 {
+            assert!(out.source.contains(&format!("[[buffer({slot})]]")), "slot {slot}: {}", out.source);
+        }
+        assert_eq!(layout.heap, BTreeMap::from([(heap::TEX_2D, 2), (heap::SAMPLERS, 3)]));
         assert_eq!(out.heap_bindings_used, 1 << heap::TEX_2D | 1 << heap::SAMPLERS);
         assert!(out.uses_immediates);
+    }
+
+    #[test]
+    fn buffer_views_are_argument_buffers_of_addresses() {
+        let m = Module::from_wgsl(
+            "t",
+            "struct L { l: array<vec4<f32>> }\n@group(7) @binding(16) var<storage, read> lights: binding_array<L>;\nstruct C { c: atomic<u32> }\n@group(7) @binding(18) var<storage, read_write> counters: binding_array<C>;\n@group(0) @binding(0) var<storage, read> xs: array<f32>;\nstruct D { a: u32 }\nvar<immediate> d: D;\n@compute @workgroup_size(1) fn main() { atomicAdd(&counters[d.a].c, u32(lights[d.a].l[0].x + xs[0])); }",
+        )
+        .unwrap();
+        let layout = Layout::for_entry_point(&m, naga::ShaderStage::Compute, "main").unwrap();
+        assert_eq!(layout.heap, BTreeMap::from([(16, 2), (18, 3)]));
+        assert_eq!(layout.heap_tables().map(|(_, t)| t).collect::<Vec<_>>(), [HeapTable::Buffers, HeapTable::Buffers]);
+        assert_eq!(
+            layout.roots[&(0, 0)],
+            RootSlot::Buffer {
+                slot: 4,
+                kind: RootKind::StorageBuffer { read_only: true }
+            }
+        );
+        let out = write(&m, &layout, naga::ShaderStage::Compute, None, &[], (3, 0), &[]).unwrap();
+        assert!(out.source.contains("NagaArgumentBufferWrapper<device L*>* lights [[buffer(2)]]"), "{}", out.source);
+        assert!(out.source.contains("[[buffer(3)]]"), "{}", out.source);
+        // in naga's order (declaration), heap views included: their entries are never read
+        assert_eq!(out.sized_buffers[..2], [(HEAP_GROUP, 16), (0, 0)]);
+        let fields = out.source.split("struct _mslBufferSizes {").nth(1).unwrap().split("};").next().unwrap().matches(';').count();
+        assert_eq!(fields, out.sized_buffers.len(), "{}", out.source);
     }
 
     #[test]
@@ -301,7 +471,7 @@ fn ray_queries_get_a_buffer_slot() {
     )
     .unwrap();
     let l = Layout::for_module(&m).unwrap();
-    assert_eq!(l.roots.get(&(0, 1)), Some(&RootSlot::AccelerationStructure(FIRST_ROOT_BUFFER_SLOT + 1)));
+    assert_eq!(l.roots.get(&(0, 1)), Some(&RootSlot::AccelerationStructure(FIRST_HEAP_SLOT + 1)));
     let out = write(&m, &l, naga::ShaderStage::Compute, None, &[], (3, 0), &[]).unwrap();
     assert!(out.source.contains("instance_acceleration_structure"), "{}", out.source);
 }
@@ -318,7 +488,7 @@ fn each_entry_point_counts_only_the_roots_it_uses() {
     assert_eq!(
         vs.roots[&(0, 13)],
         RootSlot::Buffer {
-            slot: FIRST_ROOT_BUFFER_SLOT + 1,
+            slot: FIRST_HEAP_SLOT + 1,
             kind: RootKind::UniformBuffer
         }
     );

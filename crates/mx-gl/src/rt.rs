@@ -1,0 +1,44 @@
+//! Acceleration structures: not on this tier (ray queries need bindless and the APIs' ray
+//! tracing). The types exist so that renderers compile against every backend.
+
+use std::ops::{Index, IndexMut};
+
+use mx_types as t;
+
+use crate::{Device, Error, Result};
+
+#[derive(Clone)]
+pub struct Blas(());
+
+pub struct Tlas {
+    instances: Vec<Option<t::TlasInstance<Blas>>>,
+}
+
+impl Tlas {
+    pub fn max_instances(&self) -> u32 {
+        self.instances.len() as u32
+    }
+}
+
+impl Index<usize> for Tlas {
+    type Output = Option<t::TlasInstance<Blas>>;
+    fn index(&self, i: usize) -> &Self::Output {
+        &self.instances[i]
+    }
+}
+
+impl IndexMut<usize> for Tlas {
+    fn index_mut(&mut self, i: usize) -> &mut Self::Output {
+        &mut self.instances[i]
+    }
+}
+
+impl Device {
+    pub fn create_blas(&self, _desc: &t::CreateBlasDescriptor<'_>, _sizes: &[t::BlasTriangleGeometrySizeDescriptor]) -> Result<Blas> {
+        Err(Error::Unsupported("ray tracing".into()))
+    }
+
+    pub fn create_tlas(&self, _desc: &t::CreateTlasDescriptor<'_>) -> Result<Tlas> {
+        Err(Error::Unsupported("ray tracing".into()))
+    }
+}

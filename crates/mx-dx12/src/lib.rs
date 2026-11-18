@@ -35,9 +35,9 @@ pub use command::{CommandBuffer, CommandEncoder, ComputePass, RenderPass};
 pub use device::{Adapter, Device, DeviceDescriptor, Instance, Queue, SubmissionIndex};
 pub use pipeline::{ComputePipeline, RenderPipeline, ShaderModule, ShaderModuleDescriptor};
 pub use query::QuerySet;
-pub use resource::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindingResource, Buffer, BufferBinding, BufferInitDescriptor, Sampler, Texture, TextureView};
+pub use resource::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindingResource, Buffer, BufferBinding, BufferInitDescriptor, BufferView, IndirectDraws, Sampler, Texture, TextureView};
 pub use rt::{Blas, Tlas};
-pub use surface::{Surface, SurfaceTexture};
+pub use surface::{Surface, SurfaceTexture, SwapchainMaker, SwapchainRequest};
 /// The `windows` crate this backend's native handles come from.
 pub use windows;
 
@@ -61,6 +61,10 @@ pub enum Error {
     Pipeline { label: String, message: String },
     #[error("the GPU reported an error: {0}")]
     Device(String),
+    /// The GPU is gone (removed, reset, hung): nothing made on this device works any more;
+    /// the device has to be made again.
+    #[error("the GPU was lost: {0}")]
+    DeviceLost(String),
     #[error("surface: {0}")]
     Surface(String),
 }
@@ -75,7 +79,7 @@ pub(crate) fn hr_err(what: &str, e: windows::core::Error) -> Error {
     if code == E_OUTOFMEMORY {
         Error::OutOfMemory(what.into())
     } else if code == DXGI_ERROR_DEVICE_REMOVED || code == DXGI_ERROR_DEVICE_RESET {
-        Error::Device(format!("device removed ({what}): {e}"))
+        Error::DeviceLost(format!("{what}: {e}"))
     } else {
         Error::Device(format!("{what}: {e}"))
     }
@@ -104,4 +108,36 @@ pub(crate) unsafe fn borrow<T: windows::core::Interface>(t: &T) -> std::mem::Man
     // SAFETY: `Option<T>` of a COM interface is a nullable pointer, as `T` is a non-null one;
     // the copy is never released (ManuallyDrop), so the reference count stays the owner's.
     unsafe { std::mem::transmute_copy(t) }
+}
+
+/// Objects compare and hash by identity (the same object, not equal contents), as wgpu's do.
+macro_rules! identity {
+    ($($t:ty => |$x:ident| $e:expr;)*) => {$(
+        impl PartialEq for $t {
+            fn eq(&self, o: &Self) -> bool {
+                let a = { let $x = self; $e };
+                let b = { let $x = o; $e };
+                a == b
+            }
+        }
+        impl Eq for $t {}
+        impl std::hash::Hash for $t {
+            fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+                let $x = self;
+                ($e).hash(h)
+            }
+        }
+    )*};
+}
+
+use std::sync::Arc;
+
+identity! {
+    Buffer => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    Texture => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    TextureView => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    Sampler => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    BindGroup => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    Blas => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    Device => |x| Arc::as_ptr(&x.shared) as *const u8 as usize;
 }

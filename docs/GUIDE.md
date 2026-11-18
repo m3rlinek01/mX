@@ -13,11 +13,31 @@ let (device, queue) = adapter.request_device(&mx::DeviceDescriptor {
     label: Some("game"),
     bindless_textures: 1 << 16,                       // the defaults
     bindless_samplers: 2048,
+    bindless_buffers: 1 << 15,
 })?;
 ```
 
-`bindless_textures` and `bindless_samplers` size the heap. mX lowers them to what the device
+`bindless_textures`, `bindless_samplers` and `bindless_buffers` size the heap. mX lowers them to what the device
 supports; `device.limits()` reports the sizes it got.
+
+### Choosing the graphics API
+
+A build has every backend of its platform. To offer them as a setting:
+
+```rust
+let available = mx::Instance::compiled_backends();             // e.g. DX12 | VULKAN | GL on Windows
+let instance = mx::Instance::new();
+let adapter = instance.adapter_for(mx::Backend::Dx12)          // the player's choice
+    .or_else(|_| instance.default_adapter())?;                 // or the first that works
+let (device, queue) = adapter.request_device(&Default::default())?;
+surface.configure(&device, &config);                           // the surface follows the device's backend
+```
+
+Changing the setting means dropping the device and opening one on the new backend; the same
+surface is configured with it. The renderer's code stays the same: every type is the same mX
+type whatever the backend. Pick downlevel paths from `Adapter::supports_compute`,
+`storage_buffers_per_stage` and `supports_indirect_count` (OpenGL has less), not from the
+backend's name.
 
 `Instance::enumerate_adapters` lists only adapters that can run mX. A Metal device needs
 Metal 3 and Tier 2 argument buffers; a Vulkan device needs descriptor indexing, dynamic
@@ -55,6 +75,51 @@ through `mx_samplers_cmp`.
 When a view or sampler is dropped, its index returns to the heap only after every submission
 that could still read it has finished on the GPU. Holding on to an index after dropping the
 view is a bug in the caller; mX does not detect it.
+
+## Buffers in the heap
+
+A buffer with `BufferUsages::STORAGE` can put ranges of itself in the heap as buffer views,
+which have indices of their own:
+
+```rust
+let lights = device.create_buffer(&mx::BufferDescriptor { label: Some("lights"), size, usage: mx::BufferUsages::STORAGE | mx::BufferUsages::COPY_DST })?;
+let view = lights.create_view(&mx::BufferViewDescriptor::default())?;     // the whole buffer, read-only
+let out = results.create_view(&mx::BufferViewDescriptor { writable: true, ..Default::default() })?;
+pass.set_immediates(0, bytemuck::cast_slice(&[view.index(), out.index()]));
+```
+
+Shaders read every buffer view through `mx_buffers[i].w` (an `array<u32>`) and write writable
+ones through `mx_rw_buffers[i].w`. For typed access, a shader declares its own views of the
+same heap in group 7, at bindings 16 to 63:
+
+```wgsl
+struct Light { position: vec4<f32>, colour: vec4<f32> }
+struct Lights { l: array<Light> }
+@group(7) @binding(16) var<storage, read> lights: binding_array<Lights>;
+
+struct Draw { lights: u32, count: u32 }
+var<immediate> draw: Draw;
+
+fn shade(p: vec3<f32>) -> vec3<f32> {
+    var c = vec3<f32>(0.0);
+    for (var i = 0u; i < draw.count; i++) { c += light(lights[draw.lights].l[i], p); }
+    return c;
+}
+```
+
+Every typed view is the same array of buffers seen with another element type, so one index
+works in all of them. What the bindless model asks of the renderer:
+
+- A view's offset is a multiple of `limits().buffer_view_offset_alignment`, its size a
+  multiple of 4.
+- Shaders write only views made `writable`. On Direct3D 12 a write through a read-only view
+  goes nowhere; elsewhere it is undefined.
+- Buffer accesses in a shader that uses the buffer heap are not bounds-checked, like heap
+  indices: keep counts in the data or the immediates. `arrayLength` of a heap buffer is
+  refused when the shader is created.
+- A pass sees what earlier passes and copies wrote to a heap buffer, as with bind groups. Two
+  draws of one pass that write and read the same heap buffer need the same care as in any
+  other API.
 
 ## Immediates
 
@@ -158,3 +223,27 @@ The quickest route is `wgpu-mx`: replace the `wgpu` dependency with it and keep 
 there, a renderer can move pass by pass to the heap. Bind a pass's textures through the heap
 instead of its bind groups, check that the frame is unchanged, and continue with the next
 pass.
+
+## GPU-driven draws
+
+When a compute pass decides what to draw (culling, LOD selection), it writes draw arguments
+and a count into buffers, and an `IndirectDraws` batch draws them without the CPU reading
+anything back:
+
+```rust
+let batch = device.create_indirect_draws(&mx::IndirectDrawsDescriptor { label: Some("scene"), max_draws: 65536, indexed: true })?;
+
+// each frame, after the culling pass has written `args` (DrawIndexedIndirectArgs) and `count` (u32)
+encoder.encode_indirect_draws(&batch, &pipeline, &args, 0, &count, 0, Some((&indices, 0, mx::IndexFormat::Uint32)));
+let mut pass = encoder.begin_render_pass(&desc);
+pass.set_pipeline(&pipeline);
+pass.set_immediates(0, bytemuck::bytes_of(&frame_indices));
+pass.execute_indirect_draws(&batch);
+```
+
+`encode_indirect_draws` goes outside passes, after the arguments are written: Metal and
+Direct3D 12 do work there (see ARCHITECTURE). Each draw finds its own data through
+`@builtin(instance_index)` (its `first_instance`) in heap buffers. `args` needs
+`STORAGE | INDIRECT` usage, `count` `INDIRECT`. `Adapter::supports_indirect_count` says whether
+the device has it (every Metal 3 and Direct3D 12 device; Vulkan devices with
+`drawIndirectCount`).

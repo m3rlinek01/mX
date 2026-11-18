@@ -17,6 +17,61 @@ pub enum Backend {
     Metal,
     Vulkan,
     Dx12,
+    /// OpenGL or OpenGL ES (the bound tier: no bindless on the GPU).
+    Gl,
+    /// Direct3D 11 (the bound tier).
+    Dx11,
+    /// No GPU: a device that takes every call and draws nothing (dedicated servers, tests).
+    Noop,
+}
+
+bitflags! {
+    /// A set of backends, to choose which an `Instance` opens.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct Backends: u32 {
+        const METAL = 1 << 0;
+        const VULKAN = 1 << 1;
+        const DX12 = 1 << 2;
+        const GL = 1 << 3;
+        /// The no-op device: never opened unless asked for by name (not in `ALL`).
+        const NOOP = 1 << 4;
+        /// Direct3D 11 (the bound tier).
+        const DX11 = 1 << 5;
+        /// The bindless backends.
+        const PRIMARY = Self::METAL.bits() | Self::VULKAN.bits() | Self::DX12.bits();
+        const ALL = Self::PRIMARY.bits() | Self::GL.bits() | Self::DX11.bits();
+    }
+}
+
+impl Backends {
+    /// The set `MX_BACKENDS` names (`metal`, `vulkan`, `dx12`, `gl`, `noop`, comma-separated), if set.
+    pub fn from_env() -> Option<Backends> {
+        let v = std::env::var("MX_BACKENDS").ok()?;
+        Some(v.split(',').fold(Backends::empty(), |b, name| {
+            b | match name.trim().to_ascii_lowercase().as_str() {
+                "metal" | "mtl" => Backends::METAL,
+                "vulkan" | "vk" => Backends::VULKAN,
+                "dx11" | "d3d11" => Backends::DX11,
+                "dx12" | "d3d12" => Backends::DX12,
+                "gl" | "gles" | "opengl" => Backends::GL,
+                "noop" | "none" => Backends::NOOP,
+                _ => Backends::empty(),
+            }
+        }))
+    }
+}
+
+impl From<Backend> for Backends {
+    fn from(b: Backend) -> Backends {
+        match b {
+            Backend::Metal => Backends::METAL,
+            Backend::Vulkan => Backends::VULKAN,
+            Backend::Dx12 => Backends::DX12,
+            Backend::Gl => Backends::GL,
+            Backend::Noop => Backends::NOOP,
+            Backend::Dx11 => Backends::DX11,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -28,7 +83,7 @@ pub enum DeviceType {
     Other,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AdapterInfo {
     pub name: String,
     pub backend: Backend,
@@ -37,6 +92,15 @@ pub struct AdapterInfo {
     pub vendor: u32,
     pub device: u32,
     pub driver: String,
+}
+
+/// What the system says about a GPU's memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdapterMemory {
+    /// The GPU's own memory (on unified-memory GPUs, what the system lets it use).
+    pub dedicated_bytes: u64,
+    /// What the driver lets the program allocate all together, where it says.
+    pub budget_bytes: Option<u64>,
 }
 
 /// What a device can hold. The bindless capacities are fixed when the device is opened.
@@ -49,11 +113,59 @@ pub struct Limits {
     pub max_bindless_textures: u32,
     /// Samplers that can be in the heap at once.
     pub max_bindless_samplers: u32,
+    /// Buffer views that can be in the heap at once.
+    pub max_bindless_buffers: u32,
+    /// What a buffer view's offset is a multiple of.
+    pub buffer_view_offset_alignment: u32,
     /// Bytes of `var<immediate>` data per draw.
     pub max_immediate_size: u32,
     pub max_vertex_buffers: u32,
     pub max_root_buffers: u32,
     pub max_color_attachments: u32,
+    /// The largest buffer.
+    pub max_buffer_size: u64,
+    /// The largest range of a storage buffer one binding (or buffer view) reaches.
+    pub max_storage_buffer_binding_size: u64,
+    /// What root uniform and storage buffer binding offsets are multiples of.
+    pub min_uniform_buffer_offset_alignment: u32,
+    pub min_storage_buffer_offset_alignment: u32,
+}
+
+impl Limits {
+    /// These limits, none above `cap`'s (what a program asks a device to keep to: a weaker
+    /// chip's, to test on). Alignments are kept at the larger of the two.
+    pub fn capped(self, cap: Option<&Limits>) -> Limits {
+        let Some(c) = cap else { return self };
+        Limits {
+            max_texture_dimension_2d: self.max_texture_dimension_2d.min(c.max_texture_dimension_2d),
+            max_texture_dimension_3d: self.max_texture_dimension_3d.min(c.max_texture_dimension_3d),
+            max_texture_array_layers: self.max_texture_array_layers.min(c.max_texture_array_layers),
+            max_bindless_textures: self.max_bindless_textures.min(c.max_bindless_textures),
+            max_bindless_samplers: self.max_bindless_samplers.min(c.max_bindless_samplers),
+            max_bindless_buffers: self.max_bindless_buffers.min(c.max_bindless_buffers),
+            buffer_view_offset_alignment: self.buffer_view_offset_alignment.max(c.buffer_view_offset_alignment),
+            max_immediate_size: self.max_immediate_size.min(c.max_immediate_size),
+            max_vertex_buffers: self.max_vertex_buffers.min(c.max_vertex_buffers),
+            max_root_buffers: self.max_root_buffers.min(c.max_root_buffers),
+            max_color_attachments: self.max_color_attachments.min(c.max_color_attachments),
+            max_buffer_size: self.max_buffer_size.min(c.max_buffer_size),
+            max_storage_buffer_binding_size: self.max_storage_buffer_binding_size.min(c.max_storage_buffer_binding_size),
+            min_uniform_buffer_offset_alignment: self.min_uniform_buffer_offset_alignment.max(c.min_uniform_buffer_offset_alignment),
+            min_storage_buffer_offset_alignment: self.min_storage_buffer_offset_alignment.max(c.min_storage_buffer_offset_alignment),
+        }
+    }
+
+    /// An older chip's (WebGPU's downlevel limits, as wgpu names them): 2048 texels a side,
+    /// 256 array layers, 256 MB buffers.
+    pub fn downlevel() -> Limits {
+        Limits {
+            max_texture_dimension_2d: 2048,
+            max_texture_dimension_3d: 256,
+            max_texture_array_layers: 256,
+            max_buffer_size: 1 << 28,
+            ..Limits::default()
+        }
+    }
 }
 
 impl Default for Limits {
@@ -64,10 +176,16 @@ impl Default for Limits {
             max_texture_array_layers: 2048,
             max_bindless_textures: 1 << 16,
             max_bindless_samplers: 2048,
+            max_bindless_buffers: 1 << 15,
+            buffer_view_offset_alignment: 256,
             max_immediate_size: 128,
             max_vertex_buffers: 8,
             max_root_buffers: 13,
             max_color_attachments: 8,
+            max_buffer_size: 1 << 28,
+            max_storage_buffer_binding_size: 1 << 27,
+            min_uniform_buffer_offset_alignment: 256,
+            min_storage_buffer_offset_alignment: 256,
         }
     }
 }
@@ -91,6 +209,41 @@ bitflags! {
         const QUERY_RESOLVE = 1 << 9;
         /// Vertex or index data of a bottom-level acceleration structure build.
         const BLAS_INPUT = 1 << 10;
+    }
+}
+
+/// A range of a buffer in the bindless heap, read in WGSL through `mx_buffers[i]`,
+/// `mx_rw_buffers[i]` or a typed view the shader declares (see `mx_shader`). The buffer
+/// needs `STORAGE` usage.
+#[derive(Clone, Debug, Default)]
+pub struct BufferViewDescriptor<'a> {
+    pub label: Option<&'a str>,
+    /// A multiple of `Limits::buffer_view_offset_alignment`.
+    pub offset: u64,
+    /// Bytes from `offset`, a multiple of 4; `None`: to the end of the buffer.
+    pub size: Option<u64>,
+    /// Shaders may write the view (`mx_rw_buffers`, `var<storage, read_write>` views). Writing
+    /// a view made without it is undefined, and on Direct3D 12 the write goes nowhere.
+    pub writable: bool,
+}
+
+impl BufferViewDescriptor<'_> {
+    /// Check the view against its buffer and return its size in bytes. Panics on misuse, as
+    /// wgpu's validation would report it.
+    pub fn resolve(&self, buffer_size: u64, usage: BufferUsages, limits: &Limits) -> u64 {
+        assert!(usage.contains(BufferUsages::STORAGE), "a buffer view needs a buffer with STORAGE usage");
+        let align = limits.buffer_view_offset_alignment.max(4) as u64;
+        assert!(self.offset.is_multiple_of(align), "buffer view offset {} is not a multiple of {align}", self.offset);
+        assert!(self.offset <= buffer_size, "buffer view offset {} past the end of the buffer ({buffer_size} bytes)", self.offset);
+        let size = self.size.unwrap_or(buffer_size - self.offset);
+        assert!(
+            self.offset + size <= buffer_size,
+            "buffer view {}..{} outside the buffer ({buffer_size} bytes)",
+            self.offset,
+            self.offset + size
+        );
+        assert!(size.is_multiple_of(4) && size > 0, "buffer view size {size} is not a positive multiple of 4");
+        size
     }
 }
 
@@ -890,6 +1043,18 @@ pub struct RenderPassDescriptor<'a, T, Q> {
     pub occlusion_query_set: Option<&'a Q>,
 }
 
+impl<T, Q> Default for RenderPassDescriptor<'_, T, Q> {
+    fn default() -> Self {
+        RenderPassDescriptor {
+            label: None,
+            color_attachments: &[],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TexelCopyTextureInfo<'a, T> {
     pub texture: &'a T,
@@ -936,6 +1101,19 @@ pub struct DrawIndexedIndirectArgs {
     pub first_index: u32,
     pub base_vertex: i32,
     pub first_instance: u32,
+}
+
+/// A batch of draws whose arguments and count the GPU writes (GPU-driven rendering): made once,
+/// filled by `CommandEncoder::encode_indirect_draws` outside passes, drawn by
+/// `RenderPass::execute_indirect_draws`. Metal encodes it into an indirect command buffer,
+/// Vulkan draws it with `vkCmdDraw*IndirectCount`, Direct3D 12 with `ExecuteIndirect`.
+#[derive(Clone, Debug, Default)]
+pub struct IndirectDrawsDescriptor<'a> {
+    pub label: Option<&'a str>,
+    /// The most draws the batch holds; the count buffer gives how many run.
+    pub max_draws: u32,
+    /// Its arguments are `DrawIndexedIndirectArgs` (else `DrawIndirectArgs`).
+    pub indexed: bool,
 }
 
 #[repr(C)]

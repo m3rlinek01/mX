@@ -170,6 +170,13 @@ impl Buffer {
         self.map(range, false, |p, n| f(unsafe { std::slice::from_raw_parts(p, n) }))
     }
 
+    /// Read the buffer's contents now, without waiting: the caller knows the submissions
+    /// that wrote it are done (`Device::is_done`), as after wgpu's `map_async`. Needs `MAP_READ`.
+    pub fn map_read_now<R>(&self, range: Range<u64>, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        // SAFETY: the mapped range, read-only, while the GPU is idle.
+        self.map(range, false, |p, n| f(unsafe { std::slice::from_raw_parts(p, n) }))
+    }
+
     /// Write the buffer's contents from the CPU. Waits until the GPU has finished all
     /// submitted work first. Needs `MAP_WRITE`.
     pub fn map_write<R>(&self, range: Range<u64>, f: impl FnOnce(&mut [u8]) -> R) -> Result<R> {
@@ -202,6 +209,107 @@ impl Buffer {
     /// buffers `GENERIC_READ`, readback buffers `COPY_DEST`).
     pub fn raw(&self) -> &ID3D12Resource {
         &self.0.raw
+    }
+
+    /// The identity the heap and the tracker know this buffer by.
+    pub(crate) fn key(&self) -> usize {
+        windows::core::Interface::as_raw(&self.0.raw) as usize
+    }
+
+    /// A range of the buffer in the bindless heap ([`BufferView::index`]): a raw SRV, and a raw
+    /// UAV when `writable`. Needs `STORAGE` (and no `MAP_*`: mappable buffers live in heaps
+    /// shaders cannot write).
+    pub fn create_view(&self, desc: &t::BufferViewDescriptor<'_>) -> Result<BufferView> {
+        let shared = &self.0.shared;
+        let size = desc.resolve(self.size(), self.usage(), &shared.limits);
+        assert!(!(desc.writable && self.0.track.fixed), "a writable buffer view needs a buffer without MAP_READ / MAP_WRITE");
+        let slot = shared.heap.lock().alloc_buffer(self, desc.writable)?;
+        let (first, n) = (desc.offset / 4, (size / 4) as u32);
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: first,
+                    NumElements: n,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: first,
+                    NumElements: n,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        let v = &shared.views;
+        // SAFETY: descriptors of a live buffer into the slot just allocated, which no
+        // submission reads (fresh, or past its deferred release). A read-only view's UAV is a
+        // null descriptor, so a stray write through `mx_rw_buffers` goes nowhere.
+        unsafe {
+            shared.device.CreateShaderResourceView(&self.0.raw, Some(&srv), v.view_cpu(v.buffer_srv(slot)));
+            let target = if desc.writable { Some(&self.0.raw) } else { None };
+            shared.device.CreateUnorderedAccessView(target, None, Some(&uav), v.view_cpu(v.buffer_uav(slot)));
+        }
+        Ok(BufferView(Arc::new(BufferViewInner {
+            buffer: self.clone(),
+            offset: desc.offset,
+            size,
+            writable: desc.writable,
+            slot,
+        })))
+    }
+}
+
+pub(crate) struct BufferViewInner {
+    pub buffer: Buffer,
+    pub offset: u64,
+    pub size: u64,
+    pub writable: bool,
+    slot: u32,
+}
+
+impl Drop for BufferViewInner {
+    fn drop(&mut self) {
+        let shared = &self.buffer.0.shared;
+        shared.heap.lock().release_buffer(self.slot, shared.release_after(), self.buffer.clone(), self.writable);
+    }
+}
+
+/// A range of a buffer in the bindless heap.
+#[derive(Clone)]
+pub struct BufferView(pub(crate) Arc<BufferViewInner>);
+
+impl BufferView {
+    /// The view's index in the heap: `mx_buffers[i]`, `mx_rw_buffers[i]` or a shader's own
+    /// buffer view in WGSL.
+    pub fn index(&self) -> u32 {
+        self.0.slot
+    }
+
+    pub fn buffer(&self) -> &Buffer {
+        &self.0.buffer
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.0.offset
+    }
+
+    pub fn size(&self) -> u64 {
+        self.0.size
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.0.writable
     }
 }
 
@@ -322,6 +430,12 @@ impl Texture {
     }
     pub fn usage(&self) -> t::TextureUsages {
         self.0.usage
+    }
+
+    /// The state the texture is in whenever no command list of mX's runs (see the crate docs):
+    /// work of others on mX's queue finds it there and leaves it there.
+    pub fn rest_state(&self) -> D3D12_RESOURCE_STATES {
+        self.0.track.home
     }
 
     /// Array layers (1 for a 3D texture).
@@ -808,6 +922,10 @@ pub struct BindGroupDescriptor<'a> {
 pub(crate) enum Bound {
     Buffer {
         buffer: Buffer,
+        /// The entry's offset and size (a uniform buffer's view is made anew at another
+        /// offset, see `RenderPass::set_buffer_offset`).
+        offset: u64,
+        size: u64,
         cbv: Option<Cpu>,
         srv: Option<Cpu>,
         uav: Option<Cpu>,
@@ -1025,6 +1143,8 @@ impl Device {
                         };
                         Bound::Buffer {
                             buffer: b.buffer.clone(),
+                            offset: b.offset,
+                            size,
                             cbv,
                             srv,
                             uav,
@@ -1228,5 +1348,34 @@ impl Queue {
             copy_buffer_texture(rec, &raw, fp, tex, &dst, size, true);
             Ok(())
         })
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// GPU-driven draws
+
+/// The count and index buffer of the last `encode_indirect_draws` of a batch.
+#[derive(Clone)]
+pub(crate) struct IndirectSource {
+    pub count: Buffer,
+    pub count_offset: u64,
+    pub index: Option<(Buffer, u64, t::IndexFormat)>,
+}
+
+pub(crate) struct IndirectDrawsInner {
+    pub max_draws: u32,
+    pub indexed: bool,
+    /// The arguments laid out for the pipelines' command signatures.
+    pub laid_out: Buffer,
+    pub source: parking_lot::Mutex<Option<IndirectSource>>,
+}
+
+/// A batch of draws whose arguments and count the GPU writes (see `t::IndirectDrawsDescriptor`).
+#[derive(Clone)]
+pub struct IndirectDraws(pub(crate) Arc<IndirectDrawsInner>);
+
+impl IndirectDraws {
+    pub fn max_draws(&self) -> u32 {
+        self.0.max_draws
     }
 }

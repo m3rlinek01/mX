@@ -50,8 +50,131 @@ pub struct CommandEncoder {
     sets: HashMap<(u64, usize), vk::DescriptorSet>,
     /// Occlusion query sets reset in this encoder.
     reset_queries: Vec<usize>,
-    /// Work was recorded since the last barrier.
-    dirty: bool,
+    /// What ran since the last barrier, and which writes are not yet visible where.
+    sync: SyncState,
+}
+
+/// What one command does to memory: the stages it runs in, what it may read and what it may
+/// write there.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Op {
+    pub stages: vk::PipelineStageFlags2,
+    pub reads: vk::AccessFlags2,
+    pub writes: vk::AccessFlags2,
+}
+
+impl Op {
+    /// Copies, clears, blits and resolves of the transfer stage.
+    pub const TRANSFER: Op = Op {
+        stages: vk::PipelineStageFlags2::ALL_TRANSFER,
+        reads: vk::AccessFlags2::TRANSFER_READ,
+        writes: vk::AccessFlags2::TRANSFER_WRITE,
+    };
+
+    /// Something mX cannot see into (interop through `raw()`, acceleration structure
+    /// builds): everything waits for it and for everything before it.
+    pub const ANY: Op = Op {
+        stages: vk::PipelineStageFlags2::ALL_COMMANDS,
+        reads: vk::AccessFlags2::MEMORY_READ,
+        writes: vk::AccessFlags2::MEMORY_WRITE,
+    };
+
+    const GRAPHICS_SHADERS: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(vk::PipelineStageFlags2::VERTEX_SHADER.as_raw() | vk::PipelineStageFlags2::FRAGMENT_SHADER.as_raw());
+    const SHADER_READS: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::UNIFORM_READ.as_raw() | vk::AccessFlags2::SHADER_SAMPLED_READ.as_raw() | vk::AccessFlags2::SHADER_STORAGE_READ.as_raw() | vk::AccessFlags2::INDIRECT_COMMAND_READ.as_raw(),
+    );
+
+    /// A render pass: vertex input, the graphics shaders, attachments. `storage`: a pipeline
+    /// of the pass writes memory from its shaders.
+    pub fn render(storage: bool, ray_query: bool) -> Op {
+        use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
+        let mut reads = Self::SHADER_READS | A::INDEX_READ | A::VERTEX_ATTRIBUTE_READ | A::COLOR_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_READ;
+        if ray_query {
+            reads |= A::ACCELERATION_STRUCTURE_READ_KHR;
+        }
+        let mut writes = A::COLOR_ATTACHMENT_WRITE | A::DEPTH_STENCIL_ATTACHMENT_WRITE;
+        if storage {
+            writes |= A::SHADER_STORAGE_WRITE;
+        }
+        Op {
+            stages: S::DRAW_INDIRECT | S::VERTEX_INPUT | Self::GRAPHICS_SHADERS | S::EARLY_FRAGMENT_TESTS | S::LATE_FRAGMENT_TESTS | S::COLOR_ATTACHMENT_OUTPUT,
+            reads,
+            writes,
+        }
+    }
+
+    /// A dispatch. `storage`: it writes memory.
+    pub fn compute(storage: bool, ray_query: bool) -> Op {
+        use vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
+        let mut reads = Self::SHADER_READS;
+        if ray_query {
+            reads |= A::ACCELERATION_STRUCTURE_READ_KHR;
+        }
+        Op {
+            stages: S::DRAW_INDIRECT | S::COMPUTE_SHADER,
+            reads,
+            writes: if storage { A::SHADER_STORAGE_WRITE } else { A::NONE },
+        }
+    }
+}
+
+/// The state of synchronisation within one command buffer. Instead of one full barrier
+/// between commands, each command waits only for the stages that ran before it, and only the
+/// writes it may read are made visible to it: a render pass after a compute pass that wrote a
+/// buffer waits on `COMPUTE_SHADER` writes for its vertex and fragment stages, and nothing
+/// waits for a command that ran nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SyncState {
+    /// Stages later commands must wait for: those that ran since the last barrier, and that
+    /// barrier's own second scope (so a chain of barriers stays a chain when a command between
+    /// them records nothing).
+    ran: vk::PipelineStageFlags2,
+    /// Nothing was recorded since the last barrier, whose second scope was `last_dst`.
+    idle: bool,
+    last_dst: vk::PipelineStageFlags2,
+    /// Stages and accesses of writes not yet made visible everywhere.
+    write_stages: vk::PipelineStageFlags2,
+    writes: vk::AccessFlags2,
+    /// Where those writes are visible already.
+    visible_stages: vk::PipelineStageFlags2,
+    visible: vk::AccessFlags2,
+}
+
+impl SyncState {
+    /// The barrier needed before `op` (`None`: none), and the state after it.
+    pub fn before(&mut self, op: Op) -> Option<vk::MemoryBarrier2<'static>> {
+        let dst_access = op.reads | op.writes;
+        let unseen = !self.writes.is_empty() && !(self.visible_stages.contains(op.stages) && self.visible.contains(dst_access));
+        // (the start of a command buffer, ordered by `begin_cmd`; or right after a barrier
+        // that already covers these stages)
+        if !unseen && (self.ran.is_empty() || (self.idle && self.last_dst.contains(op.stages))) {
+            return None;
+        }
+        let mut b = vk::MemoryBarrier2::default()
+            .src_stage_mask(self.ran | if unseen { self.write_stages } else { vk::PipelineStageFlags2::NONE })
+            .dst_stage_mask(op.stages);
+        if unseen {
+            b = b.src_access_mask(self.writes).dst_access_mask(dst_access);
+            self.visible_stages |= op.stages;
+            self.visible |= dst_access;
+        }
+        self.ran = op.stages;
+        self.last_dst = op.stages;
+        self.idle = true;
+        Some(b)
+    }
+
+    /// `op` was recorded.
+    pub fn after(&mut self, op: Op) {
+        self.ran |= op.stages;
+        self.idle = false;
+        if !op.writes.is_empty() {
+            self.write_stages |= op.stages;
+            self.writes |= op.writes;
+            self.visible_stages = vk::PipelineStageFlags2::NONE;
+            self.visible = vk::AccessFlags2::NONE;
+        }
+    }
 }
 
 impl Device {
@@ -71,7 +194,8 @@ impl Device {
             desc_pool: None,
             sets: HashMap::new(),
             reset_queries: Vec::new(),
-            dirty: false,
+            // (`begin_cmd` ordered the command buffer after everything before it)
+            sync: SyncState::default(),
         }
     }
 }
@@ -87,6 +211,10 @@ fn new_desc_pool(shared: &Shared) -> vk::DescriptorPool {
     let mut sizes = vec![
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 512,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
             descriptor_count: 512,
         },
         vk::DescriptorPoolSize {
@@ -120,7 +248,8 @@ impl CommandEncoder {
     /// The `VkCommandBuffer` the encoder records into, for interop (DLSS / FSR record
     /// here). Passes must be ended before; mX orders the next command after it.
     pub fn raw(&mut self) -> vk::CommandBuffer {
-        self.dirty = true;
+        self.before(Op::ANY);
+        self.after(Op::ANY);
         self.raw
     }
 
@@ -144,19 +273,20 @@ impl CommandEncoder {
         let (pool, raw) = self.shared.begin_cmd();
         self.rec.cmd_pools.push(pool);
         self.raw = raw;
-        self.dirty = false;
+        self.sync = SyncState::default();
     }
 
-    /// Before a command: wait for what came before.
-    pub(crate) fn before(&mut self) {
-        if self.dirty {
-            self.shared.full_barrier(self.raw);
-            self.dirty = false;
+    /// Before a command: wait for what it depends on (see [`SyncState`]).
+    pub(crate) fn before(&mut self, op: Op) {
+        if let Some(b) = self.sync.before(op) {
+            let b = [b];
+            self.shared.barrier2(self.raw, &vk::DependencyInfo::default().memory_barriers(&b));
         }
     }
 
-    pub(crate) fn mark_dirty(&mut self) {
-        self.dirty = true;
+    /// After a command: what it did, for the commands after it.
+    pub(crate) fn after(&mut self, op: Op) {
+        self.sync.after(op);
     }
 
     pub(crate) fn keep<T: Clone + Send + Sync + 'static>(&mut self, x: &T) {
@@ -167,6 +297,37 @@ impl CommandEncoder {
         &self.shared.raw
     }
 
+    /// Point a batch of GPU-driven draws at the arguments and the count the GPU wrote:
+    /// `count` (a `u32` at `count_offset`) draws of `args` from `args_offset`, at most the
+    /// batch's `max_draws`, drawn with `pipeline` and the index buffer `index` (indexed
+    /// batches). Outside passes, before the pass that executes the batch. (Vulkan draws
+    /// straight from the buffers; Metal and Direct3D 12 encode here.)
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_indirect_draws(
+        &mut self,
+        draws: &crate::IndirectDraws,
+        pipeline: &crate::RenderPipeline,
+        args: &Buffer,
+        args_offset: u64,
+        count: &Buffer,
+        count_offset: u64,
+        index: Option<(&Buffer, u64, t::IndexFormat)>,
+    ) {
+        let _ = pipeline;
+        assert_eq!(draws.0.indexed, index.is_some(), "an indexed batch needs an index buffer, and only it");
+        assert!(
+            args.usage().contains(t::BufferUsages::INDIRECT) && count.usage().contains(t::BufferUsages::INDIRECT),
+            "indirect draw arguments and counts need INDIRECT usage"
+        );
+        *draws.0.source.lock() = Some(crate::resource::IndirectSource {
+            args: args.clone(),
+            args_offset,
+            count: count.clone(),
+            count_offset,
+            index: index.map(|(b, o, f)| (b.clone(), o, f)),
+        });
+    }
+
     /// Fill `size` bytes (to the end with `None`) from `offset` with zeros.
     pub fn clear_buffer(&mut self, buffer: &Buffer, offset: u64, size: Option<u64>) {
         let size = size.unwrap_or(buffer.size() - offset);
@@ -174,11 +335,11 @@ impl CommandEncoder {
         if size == 0 {
             return;
         }
-        self.before();
+        self.before(Op::TRANSFER);
         // SAFETY: the range was checked above.
         unsafe { self.device().cmd_fill_buffer(self.raw, buffer.0.raw, offset, size, 0) };
         self.keep(buffer);
-        self.dirty = true;
+        self.after(Op::TRANSFER);
     }
 
     /// Zero the mips and layers of `range` (colour to 0, depth to 0.0, stencil to 0).
@@ -188,13 +349,13 @@ impl CommandEncoder {
         if mips.is_empty() || layers.is_empty() {
             return;
         }
-        self.before();
+        self.before(Op::ANY);
         let shared = self.shared.clone();
         for level in mips {
             crate::zero::zero(&shared, self.raw, &mut self.rec, texture, level, layers.clone(), range.aspect);
         }
         self.keep(texture);
-        self.dirty = true;
+        self.after(Op::ANY);
     }
 
     pub fn push_debug_group(&mut self, label: &str) {
@@ -223,39 +384,39 @@ impl CommandEncoder {
         if size == 0 {
             return;
         }
-        self.before();
+        self.before(Op::TRANSFER);
         let region = [vk::BufferCopy { src_offset, dst_offset, size }];
         // SAFETY: both ranges checked above.
         unsafe { self.device().cmd_copy_buffer(self.raw, src.0.raw, dst.0.raw, &region) };
         self.keep(src);
         self.keep(dst);
-        self.dirty = true;
+        self.after(Op::TRANSFER);
     }
 
     pub fn copy_buffer_to_texture(&mut self, src: t::TexelCopyBufferInfo<'_, Buffer>, dst: t::TexelCopyTextureInfo<'_, Texture>, size: t::Extent3d) {
         src.layout.assert_encoder_pitch();
-        self.before();
+        self.before(Op::TRANSFER);
         let region = [buffer_image_region(&dst, src.layout, src.layout.offset, size)];
         // SAFETY: the region is the caller's to keep inside both (checked by the validation layer).
         unsafe { self.device().cmd_copy_buffer_to_image(self.raw, src.buffer.0.raw, dst.texture.0.raw, vk::ImageLayout::GENERAL, &region) };
         self.keep(src.buffer);
         self.keep(dst.texture);
-        self.dirty = true;
+        self.after(Op::TRANSFER);
     }
 
     pub fn copy_texture_to_buffer(&mut self, src: t::TexelCopyTextureInfo<'_, Texture>, dst: t::TexelCopyBufferInfo<'_, Buffer>, size: t::Extent3d) {
         dst.layout.assert_encoder_pitch();
-        self.before();
+        self.before(Op::TRANSFER);
         let region = [buffer_image_region(&src, dst.layout, dst.layout.offset, size)];
         // SAFETY: as above.
         unsafe { self.device().cmd_copy_image_to_buffer(self.raw, src.texture.0.raw, vk::ImageLayout::GENERAL, dst.buffer.0.raw, &region) };
         self.keep(src.texture);
         self.keep(dst.buffer);
-        self.dirty = true;
+        self.after(Op::TRANSFER);
     }
 
     pub fn copy_texture_to_texture(&mut self, src: t::TexelCopyTextureInfo<'_, Texture>, dst: t::TexelCopyTextureInfo<'_, Texture>, size: t::Extent3d) {
-        self.before();
+        self.before(Op::TRANSFER);
         let layers = |at: &t::TexelCopyTextureInfo<'_, Texture>| {
             let is_3d = at.texture.dimension() == t::TextureDimension::D3;
             let mut aspect = conv::aspects(at.texture.format(), at.aspect);
@@ -300,7 +461,7 @@ impl CommandEncoder {
         };
         self.keep(src.texture);
         self.keep(dst.texture);
-        self.dirty = true;
+        self.after(Op::TRANSFER);
     }
 
     /// Fill a texture's mip chain from level 0 (each level a linear blit of the one above).
@@ -314,7 +475,7 @@ impl CommandEncoder {
         let is_3d = texture.dimension() == t::TextureDimension::D3;
         let layers = texture.layers();
         for level in 1..texture.mip_level_count() {
-            self.before();
+            self.before(Op::TRANSFER);
             let (a, b) = (texture.size().mip_level_size(level - 1, texture.dimension()), texture.size().mip_level_size(level, texture.dimension()));
             let corner = |e: t::Extent3d| vk::Offset3D {
                 x: e.width as i32,
@@ -338,7 +499,7 @@ impl CommandEncoder {
                 self.device()
                     .cmd_blit_image(self.raw, texture.0.raw, vk::ImageLayout::GENERAL, texture.0.raw, vk::ImageLayout::GENERAL, &region, filter)
             };
-            self.dirty = true;
+            self.after(Op::TRANSFER);
         }
         self.keep(texture);
     }
@@ -452,7 +613,7 @@ impl CommandEncoder {
     }
 
     pub fn begin_render_pass(&mut self, desc: &t::RenderPassDescriptor<'_, TextureView, QuerySet>) -> RenderPass<'_> {
-        self.before();
+        self.before(Op::render(true, self.shared.caps.ray_query));
         if let Some(q) = desc.occlusion_query_set {
             assert!(q.ty() == t::QueryType::Occlusion, "occlusion queries in a timestamp query set");
             self.reset_occlusion(q);
@@ -583,6 +744,7 @@ impl CommandEncoder {
             end_timestamp,
             labelled: desc.label.is_some(),
             label: desc.label.unwrap_or("render pass").to_owned(),
+            writes: false,
         };
         // WebGPU's defaults: the whole target, no blend constant, stencil reference 0
         pass.set_viewport(0.0, 0.0, extent.width as f32, extent.height as f32, 0.0, 1.0);
@@ -593,7 +755,7 @@ impl CommandEncoder {
     }
 
     pub fn begin_compute_pass(&mut self, desc: &t::ComputePassDescriptor<'_, QuerySet>) -> ComputePass<'_> {
-        self.before();
+        self.before(Op::compute(true, self.shared.caps.ray_query));
         let mut end_timestamp = None;
         if let Some(ts) = &desc.timestamp_writes {
             for i in [ts.beginning_of_pass_write_index, ts.end_of_pass_write_index].into_iter().flatten() {
@@ -624,6 +786,9 @@ struct PassState {
     roots_dirty: bool,
     immediates: Box<[u8; MAX_IMMEDIATES]>,
     immediates_dirty: bool,
+    /// Offsets added to root uniform buffers' own (`set_buffer_offset`): (group, binding,
+    /// bytes), passed as the descriptor sets' dynamic offsets.
+    offsets: Vec<(u32, u32, u64)>,
 }
 
 impl Default for PassState {
@@ -633,6 +798,7 @@ impl Default for PassState {
             roots_dirty: true,
             immediates: Box::new([0; MAX_IMMEDIATES]),
             immediates_dirty: true,
+            offsets: Vec::new(),
         }
     }
 }
@@ -641,6 +807,15 @@ impl PassState {
     fn set_bind_group(&mut self, group: u32, bind_group: &BindGroup) {
         assert!(group <= MAX_ROOT_GROUP, "root bind groups are 0..={MAX_ROOT_GROUP}; group {} is the heap", mx_shader::HEAP_GROUP);
         self.groups[group as usize] = Some(bind_group.clone());
+        self.offsets.retain(|o| o.0 != group);
+        self.roots_dirty = true;
+    }
+
+    fn set_buffer_offset(&mut self, group: u32, binding: u32, offset: u64) {
+        match self.offsets.iter_mut().find(|o| o.0 == group && o.1 == binding) {
+            Some(o) => o.2 = offset,
+            None => self.offsets.push((group, binding, offset)),
+        }
         self.roots_dirty = true;
     }
 
@@ -670,8 +845,16 @@ fn flush(enc: &mut CommandEncoder, p: &PipelineInner, state: &mut PassState, lab
                 panic!("{label}: draw with nothing bound at @group({g}) @binding({})", group.bindings[0].0);
             };
             let set = enc.root_set(g as u32, group, &bg, label);
+            // (every root uniform buffer is dynamic: `set_buffer_offset`'s offset, else 0, in
+            // binding order)
+            let dynamic: Vec<u32> = group
+                .bindings
+                .iter()
+                .filter(|b| b.2 == vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .map(|b| state.offsets.iter().find(|o| o.0 == g as u32 && o.1 == b.0).map_or(0, |o| o.2 as u32))
+                .collect();
             // SAFETY: a set of the layout the pipeline layout has at `g + 1`.
-            unsafe { enc.shared.raw.cmd_bind_descriptor_sets(enc.raw, p.bind_point, p.layout, g as u32 + 1, &[set], &[]) };
+            unsafe { enc.shared.raw.cmd_bind_descriptor_sets(enc.raw, p.bind_point, p.layout, g as u32 + 1, &[set], &dynamic) };
         }
         state.roots_dirty = false;
     }
@@ -695,6 +878,8 @@ pub struct RenderPass<'e> {
     end_timestamp: Option<(QuerySet, u32)>,
     labelled: bool,
     label: String,
+    /// A pipeline of the pass writes memory from its shaders.
+    writes: bool,
 }
 
 impl Drop for RenderPass<'_> {
@@ -716,7 +901,8 @@ impl Drop for RenderPass<'_> {
         if self.labelled {
             self.enc.pop_debug_group();
         }
-        self.enc.dirty = true;
+        let rq = self.enc.shared.caps.ray_query;
+        self.enc.after(Op::render(self.writes, rq));
     }
 }
 
@@ -726,6 +912,7 @@ impl RenderPass<'_> {
     }
 
     pub fn set_pipeline(&mut self, pipeline: &RenderPipeline) {
+        self.writes |= pipeline.0.writes;
         bind_pipeline(self.enc, &pipeline.0);
         self.enc.keep(pipeline);
         self.pipeline = Some(pipeline.clone());
@@ -735,6 +922,14 @@ impl RenderPass<'_> {
 
     pub fn set_bind_group(&mut self, group: u32, bind_group: &BindGroup) {
         self.state.set_bind_group(group, bind_group);
+    }
+
+    /// Read the buffer at (`group`, `binding`) of the bind group set at `group` from `offset`
+    /// bytes past its own offset, for the draws that follow (until that group is set again):
+    /// a draw's constants in one buffer of many. A multiple of
+    /// `min_uniform_buffer_offset_alignment`; uniform buffers only on this backend.
+    pub fn set_buffer_offset(&mut self, group: u32, binding: u32, offset: u64) {
+        self.state.set_buffer_offset(group, binding, offset);
     }
 
     /// Set `data` at byte `offset` of the shader's `var<immediate>` block.
@@ -798,6 +993,7 @@ impl RenderPass<'_> {
         self.pipeline = None;
         self.index = false;
         self.state.groups = Default::default();
+        self.state.offsets.clear();
         self.state.roots_dirty = true;
         self.state.immediates_dirty = true;
     }
@@ -851,6 +1047,30 @@ impl RenderPass<'_> {
             }
         }
         self.enc.keep(args);
+    }
+
+    /// Draw a batch the GPU filled (see `CommandEncoder::encode_indirect_draws`), with the
+    /// pipeline and bindings set now: `vkCmdDraw[Indexed]IndirectCount`.
+    pub fn execute_indirect_draws(&mut self, draws: &crate::IndirectDraws) {
+        let src = draws.0.source.lock().clone().expect("execute_indirect_draws before encode_indirect_draws");
+        if let Some((b, offset, format)) = &src.index {
+            self.set_index_buffer(b, *offset, *format);
+        }
+        self.flush();
+        let (cmd, d) = self.cmd();
+        // SAFETY: argument structs of Vulkan's layout, in live buffers; Vulkan clamps the count
+        // to `max_draws`. (Core in Vulkan 1.2, mX's minimum.)
+        unsafe {
+            if draws.0.indexed {
+                let stride = std::mem::size_of::<t::DrawIndexedIndirectArgs>() as u32;
+                d.cmd_draw_indexed_indirect_count(cmd, src.args.0.raw, src.args_offset, src.count.0.raw, src.count_offset, draws.0.max_draws, stride);
+            } else {
+                let stride = std::mem::size_of::<t::DrawIndirectArgs>() as u32;
+                d.cmd_draw_indirect_count(cmd, src.args.0.raw, src.args_offset, src.count.0.raw, src.count_offset, draws.0.max_draws, stride);
+            }
+        }
+        self.enc.keep(&src.args);
+        self.enc.keep(&src.count);
     }
 
     pub fn multi_draw_indexed_indirect(&mut self, args: &Buffer, offset: u64, count: u32) {
@@ -932,7 +1152,7 @@ impl Drop for ComputePass<'_> {
         if let Some((q, i)) = self.end_timestamp.take() {
             self.enc.timestamp(&q, i);
         }
-        self.enc.dirty = true;
+        // (each dispatch told the encoder what it did)
     }
 }
 
@@ -953,12 +1173,14 @@ impl ComputePass<'_> {
         self.state.set_immediates(offset, data);
     }
 
+    /// Bind what the dispatch reads, after waiting for the dispatches before it (as wgpu
+    /// orders them): an execution dependency, and their writes made visible if they wrote.
     fn flush(&mut self) {
         let pipeline = self.pipeline.clone().expect("dispatch without a pipeline");
-        if self.dispatched {
-            self.enc.shared.full_barrier(self.enc.raw);
-        }
+        let rq = self.enc.shared.caps.ray_query;
+        self.enc.before(Op::compute(true, rq));
         flush(self.enc, &pipeline.0, &mut self.state, &pipeline.0.label);
+        self.enc.after(Op::compute(pipeline.0.writes, rq));
         self.dispatched = true;
     }
 
@@ -993,5 +1215,50 @@ impl ComputePass<'_> {
     /// The `VkCommandBuffer`, for interop.
     pub fn raw(&self) -> vk::CommandBuffer {
         self.enc.raw
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::{Op, SyncState};
+    use ash::vk::{AccessFlags2 as A, PipelineStageFlags2 as S};
+
+    #[test]
+    fn writes_are_made_visible_where_read_and_only_once() {
+        let mut s = SyncState::default();
+        assert!(s.before(Op::compute(true, false)).is_none(), "the start of a command buffer is ordered already");
+        s.after(Op::compute(true, false));
+        let b = s.before(Op::render(false, false)).expect("a render pass after a compute write waits");
+        assert!(b.src_stage_mask.contains(S::COMPUTE_SHADER));
+        assert!(b.src_access_mask.contains(A::SHADER_STORAGE_WRITE));
+        assert!(b.dst_access_mask.contains(A::SHADER_SAMPLED_READ));
+        s.after(Op::render(false, false));
+        // the compute writes are visible to the graphics stages now; the next pass waits on
+        // execution only, but its attachments' writes are new
+        let b = s.before(Op::TRANSFER).expect("a copy after a render pass waits");
+        assert!(b.src_access_mask.contains(A::COLOR_ATTACHMENT_WRITE));
+        assert!(b.src_stage_mask.contains(S::COMPUTE_SHADER), "the compute writes are not visible to transfers yet");
+    }
+
+    #[test]
+    fn a_barrier_with_nothing_after_it_is_not_repeated_but_chains() {
+        let mut s = SyncState::default();
+        s.after(Op::TRANSFER);
+        assert!(s.before(Op::compute(true, false)).is_some());
+        assert!(s.before(Op::compute(true, false)).is_none(), "nothing ran since the barrier");
+        // an empty compute pass, then a render pass: it still waits for the copy, through the
+        // compute stages the last barrier covered
+        let b = s.before(Op::render(false, false)).unwrap();
+        assert!(b.src_stage_mask.contains(S::COMPUTE_SHADER));
+        assert!(b.src_stage_mask.contains(S::ALL_TRANSFER), "the copy's writes are made visible");
+    }
+
+    #[test]
+    fn reads_after_reads_need_execution_order_only() {
+        let mut s = SyncState::default();
+        s.after(Op::compute(false, false));
+        let b = s.before(Op::compute(true, false)).unwrap();
+        assert_eq!(b.src_access_mask, A::NONE);
+        assert_eq!(b.src_stage_mask, S::DRAW_INDIRECT | S::COMPUTE_SHADER);
     }
 }

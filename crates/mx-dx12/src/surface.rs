@@ -34,9 +34,23 @@ unsafe impl Send for Hwnd {}
 // SAFETY: as above.
 unsafe impl Sync for Hwnd {}
 
+/// What a swapchain maker is given: a vendor's frame generation (DLSS-G, FSR 3, XeSS-FG)
+/// makes the window's swapchain itself, from these, and hands back its own.
+pub struct SwapchainRequest<'a> {
+    pub factory: &'a IDXGIFactory4,
+    pub queue: &'a ID3D12CommandQueue,
+    pub hwnd: HWND,
+    pub desc: &'a DXGI_SWAP_CHAIN_DESC1,
+}
+
+/// Makes a surface's swapchain in place of `IDXGIFactory2::CreateSwapChainForHwnd`
+/// (`Surface::set_swapchain_maker`).
+pub type SwapchainMaker = Arc<dyn Fn(&SwapchainRequest<'_>) -> windows::core::Result<IDXGISwapChain1> + Send + Sync>;
+
 struct Swap {
     raw: IDXGISwapChain3,
-    waitable: Handle,
+    /// (None: the swapchain gives none, as some vendors' do)
+    waitable: Option<Handle>,
     flags: DXGI_SWAP_CHAIN_FLAG,
     shared: Arc<Shared>,
     config: t::SurfaceConfiguration,
@@ -47,8 +61,10 @@ impl Drop for Swap {
         // (the queue must be done with the buffers before the swapchain goes)
         let _ = self.shared.wait_idle();
         // SAFETY: the swapchain's own waitable object, closed once.
-        unsafe {
-            let _ = CloseHandle(self.waitable.0);
+        if let Some(w) = self.waitable {
+            unsafe {
+                let _ = CloseHandle(w.0);
+            }
         }
     }
 }
@@ -59,6 +75,7 @@ pub struct Surface<'w> {
     hwnd: Hwnd,
     allow_tearing: bool,
     swap: Mutex<Option<Swap>>,
+    maker: Mutex<Option<SwapchainMaker>>,
     _window: Option<Box<dyn Window + Send + Sync + 'w>>,
     _lifetime: PhantomData<&'w ()>,
 }
@@ -75,6 +92,7 @@ impl Instance {
             hwnd: s.hwnd,
             allow_tearing: s.allow_tearing,
             swap: Mutex::new(None),
+            maker: Mutex::new(None),
             _window: Some(Box::new(window)),
             _lifetime: PhantomData,
         })
@@ -92,6 +110,7 @@ impl Instance {
                 hwnd: Hwnd(HWND(h.hwnd.get() as *mut _)),
                 allow_tearing: self.allow_tearing,
                 swap: Mutex::new(None),
+                maker: Mutex::new(None),
                 _window: None,
                 _lifetime: PhantomData,
             }),
@@ -166,12 +185,22 @@ impl Surface<'_> {
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
             Flags: flags.0 as u32,
         };
+        let maker = self.maker.lock().clone();
         // SAFETY: a live window (the surface's contract) and the device's direct queue.
         let raw = unsafe {
-            let sc1 = self
-                .factory
-                .CreateSwapChainForHwnd(&shared.queue, self.hwnd.0, &desc, None, None)
-                .expect("IDXGIFactory2::CreateSwapChainForHwnd failed");
+            let sc1 = match maker {
+                Some(make) => make(&SwapchainRequest {
+                    factory: &self.factory,
+                    queue: &shared.queue,
+                    hwnd: self.hwnd.0,
+                    desc: &desc,
+                })
+                .expect("the surface's swapchain maker failed"),
+                None => self
+                    .factory
+                    .CreateSwapChainForHwnd(&shared.queue, self.hwnd.0, &desc, None, None)
+                    .expect("IDXGIFactory2::CreateSwapChainForHwnd failed"),
+            };
             let _ = self.factory.MakeWindowAssociation(self.hwnd.0, DXGI_MWA_NO_ALT_ENTER);
             sc1.cast::<IDXGISwapChain3>().expect("no IDXGISwapChain3")
         };
@@ -180,9 +209,14 @@ impl Surface<'_> {
             let _ = raw.SetMaximumFrameLatency(config.desired_maximum_frame_latency.max(1));
             raw.GetFrameLatencyWaitableObject()
         };
+        let waitable = (!waitable.is_invalid() && !waitable.0.is_null()).then_some(Handle(waitable));
+        // (a vendor's swapchain may be made with other flags than asked: DLSS-G drops the latency
+        // object; `ResizeBuffers` must be given the swapchain's own)
+        // SAFETY: a plain getter.
+        let flags = unsafe { raw.GetDesc1() }.map_or(flags, |d| DXGI_SWAP_CHAIN_FLAG(d.Flags as i32));
         *guard = Some(Swap {
             raw,
-            waitable: Handle(waitable),
+            waitable,
             flags,
             shared: shared.clone(),
             config: config.clone(),
@@ -195,7 +229,9 @@ impl Surface<'_> {
             panic!("get_current_texture on a surface that was never configured");
         };
         // SAFETY: the swapchain's waitable object.
-        if unsafe { WaitForSingleObject(s.waitable.0, 1000) } == WAIT_TIMEOUT {
+        if let Some(w) = s.waitable
+            && unsafe { WaitForSingleObject(w.0, 1000) } == WAIT_TIMEOUT
+        {
             return t::CurrentSurfaceTexture::Timeout;
         }
         // SAFETY: plain getters on a live swapchain.
@@ -226,6 +262,19 @@ impl Surface<'_> {
             interval,
             flags,
         })
+    }
+
+    /// Have `maker` make the swapchain from the next `configure` on (None: DXGI's own again).
+    /// The current swapchain is let go of, once the GPU is done with it: configure the surface
+    /// again before the next frame.
+    pub fn set_swapchain_maker(&self, maker: Option<SwapchainMaker>) {
+        *self.maker.lock() = maker;
+        *self.swap.lock() = None;
+    }
+
+    /// The configuration of the current swapchain.
+    pub fn config(&self) -> Option<t::SurfaceConfiguration> {
+        self.swap.lock().as_ref().map(|s| s.config.clone())
     }
 
     /// The `IDXGISwapChain3`, once configured, for interop.

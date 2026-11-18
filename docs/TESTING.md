@@ -7,7 +7,8 @@ bytes it reads back. Every backend has to pass the same tests.
 
 ```sh
 cargo test -p mx --test conformance                      # the platform's backend
-cargo test -p mx --test conformance --features vulkan    # Vulkan (MoltenVK on macOS)
+MX_BACKENDS=vulkan cargo test -p mx --test conformance    # Vulkan (MoltenVK on macOS)
+MX_BACKENDS=gl cargo test -p mx --test conformance        # OpenGL (EGL: Linux, ANGLE on Windows)
 ```
 
 The tests take the GPU one at a time (see the Metal timestamp note in
@@ -31,7 +32,7 @@ Vulkan, with the Khronos layer (`brew install vulkan-validationlayers` on macOS)
 export VK_LAYER_PATH=/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d
 export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
 export VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true
-cargo test -p mx --features vulkan -- --test-threads=1
+MX_BACKENDS=vulkan cargo test -p mx -- --test-threads=1
 ```
 
 mX prints validation errors to stderr as `[mX Vulkan validation error]`. Two reports are known

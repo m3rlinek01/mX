@@ -447,7 +447,13 @@ struct Mx {
 }
 
 fn mx_gpu() -> Mx {
-    let adapter = mx::Instance::new().default_adapter().expect("an mX adapter");
+    let adapter = mx::Instance::with_backends(if cfg!(feature = "vulkan") {
+        mx::Backends::VULKAN
+    } else {
+        mx::Backends::PRIMARY - mx::Backends::VULKAN
+    })
+    .default_adapter()
+    .expect("an mX adapter");
     let (device, queue) = adapter.request_device(&Default::default()).unwrap();
     Mx { device, queue }
 }

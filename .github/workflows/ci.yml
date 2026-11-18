@@ -95,7 +95,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: |
-          cargo clippy -p mx-dx12 -p mx -p wgpu-mx --all-targets -- -D warnings
+          cargo clippy -p mx-dx12 -p mx-dx11 -p mx -p mx-upscale -p wgpu-mx --all-targets -- -D warnings
           cargo clippy -p wgpu-mx --features custom --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test -p mx-types -p mx-shader --all-features

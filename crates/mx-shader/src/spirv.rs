@@ -2,7 +2,7 @@
 //!
 //! | descriptor set | use |
 //! |----------------|-----|
-//! | 0              | the heap: binding `b` is `heap::*` (runtime arrays, UPDATE_AFTER_BIND, PARTIALLY_BOUND) |
+//! | 0              | the heap: binding `b` is `heap::*` (runtime arrays, UPDATE_AFTER_BIND, PARTIALLY_BOUND); every view of the buffer heap is binding `heap::BUFFERS`, one array of storage buffers |
 //! | 1..=7          | root group `g` is set `g + 1`; bindings keep their WGSL numbers |
 //!
 //! `var<immediate>` is the push-constant block (offset 0, every stage of a pipeline).
@@ -17,6 +17,12 @@ use naga::back::spv;
 
 /// The descriptor set of the bindless heap.
 pub const HEAP_SET: u32 = 0;
+
+/// The descriptor binding of WGSL heap binding `binding`: buffer views all alias the one array
+/// of storage buffers (Vulkan lets several variables share a binding of the same type).
+pub const fn heap_binding(binding: u32) -> u32 {
+    if heap::is_buffer(binding) { heap::BUFFERS } else { binding }
+}
 
 /// The descriptor set of root group `group`.
 pub const fn root_set(group: u32) -> u32 {
@@ -61,9 +67,9 @@ impl Default for Options {
 impl Options {
     /// The bounds checks wgpu-hal's Vulkan backend writes for a checked module: `Restrict`,
     /// except what the device's robustness features already cover.
-    pub fn bounds_check_policies(&self) -> naga::proc::BoundsCheckPolicies {
+    pub fn bounds_check_policies(&self, m: &Module) -> naga::proc::BoundsCheckPolicies {
         use naga::proc::BoundsCheckPolicy as P;
-        let mut p = crate::bounds_check_policies();
+        let mut p = m.bounds_check_policies();
         if self.robust_buffer_access2 {
             p.buffer = P::Unchecked;
         }
@@ -80,8 +86,8 @@ pub struct Output {
     pub words: Vec<u32>,
     /// The entry point's name in `words`.
     pub entry_point: String,
-    /// Which heap bindings the entry point reads (bit per `heap::*`).
-    pub heap_bindings_used: u32,
+    /// Which heap bindings the entry point reads (bit per `heap::*` and buffer view).
+    pub heap_bindings_used: u64,
     pub uses_immediates: bool,
     /// The root bindings this entry point uses, sorted by (group, binding).
     pub roots: Vec<RootBinding>,
@@ -107,6 +113,7 @@ fn capabilities(options: &Options) -> naga::FastHashSet<spv::Capability> {
         C::ShaderNonUniform,
         C::RuntimeDescriptorArray,
         C::SampledImageArrayNonUniformIndexing,
+        C::StorageBufferArrayNonUniformIndexing,
         C::ClipDistance,
         C::CullDistance,
         C::DrawParameters,
@@ -141,12 +148,13 @@ fn capabilities(options: &Options) -> naga::FastHashSet<spv::Capability> {
 /// The binding map of a module: the heap in set 0, root group `g` in set `g + 1`.
 pub fn binding_map(m: &Module) -> spv::BindingMap {
     let mut map = spv::BindingMap::new();
-    for b in 0..heap::COUNT {
+    let views = m.heap_buffers.iter().map(|v| v.binding);
+    for b in (0..heap::COUNT).chain(views) {
         map.insert(
             naga::ResourceBinding { group: HEAP_GROUP, binding: b },
             spv::BindingInfo {
                 descriptor_set: HEAP_SET,
-                binding: b,
+                binding: heap_binding(b),
                 binding_array_size: None,
             },
         );
@@ -168,11 +176,13 @@ const OP_CAPABILITY: u32 = 17;
 const OP_TYPE_RUNTIME_ARRAY: u32 = 29;
 const OP_TYPE_POINTER: u32 = 32;
 const STORAGE_UNIFORM_CONSTANT: u32 = 0;
+const STORAGE_STORAGE_BUFFER: u32 = 12;
 const CAPABILITY_RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
 
 /// naga writes the heap's unbounded `binding_array`s as runtime arrays of descriptors but does
 /// not declare `RuntimeDescriptorArray`, which Vulkan requires for them (core in SPIR-V 1.5;
-/// the device feature is `runtimeDescriptorArray`). Declare it where needed.
+/// the device feature is `runtimeDescriptorArray`). Declare it where needed: for the texture
+/// and sampler arrays (`UniformConstant`) and for the buffer heap (`StorageBuffer`).
 fn declare_runtime_descriptor_arrays(words: &mut Vec<u32>) {
     let mut runtime_arrays = Vec::new();
     let mut needed = false;
@@ -185,7 +195,7 @@ fn declare_runtime_descriptor_arrays(words: &mut Vec<u32>) {
         match op {
             OP_CAPABILITY if words[i + 1] == CAPABILITY_RUNTIME_DESCRIPTOR_ARRAY => return,
             OP_TYPE_RUNTIME_ARRAY => runtime_arrays.push(words[i + 1]),
-            OP_TYPE_POINTER if words[i + 2] == STORAGE_UNIFORM_CONSTANT && runtime_arrays.contains(&words[i + 3]) => needed = true,
+            OP_TYPE_POINTER if matches!(words[i + 2], STORAGE_UNIFORM_CONSTANT | STORAGE_STORAGE_BUFFER) && runtime_arrays.contains(&words[i + 3]) => needed = true,
             _ => {}
         }
         i += len;
@@ -215,7 +225,7 @@ pub fn write(m: &Module, stage: naga::ShaderStage, entry: Option<&str>, constant
         fake_missing_bindings: false,
         binding_map: binding_map(m),
         capabilities: Some(capabilities(options)),
-        bounds_check_policies: options.bounds_check_policies(),
+        bounds_check_policies: options.bounds_check_policies(m),
         zero_initialize_workgroup_memory: if options.native_zero_init {
             spv::ZeroInitializeWorkgroupMemoryMode::Native
         } else {
@@ -242,20 +252,8 @@ pub fn write(m: &Module, stage: naga::ShaderStage, entry: Option<&str>, constant
         .find(|(_, e)| e.stage == stage && e.name == name)
         .ok_or_else(|| backend_err("entry point lost".into()))?;
     let ep_info = info.get_entry_point(ep_index);
-    let mut heap_bindings_used = 0;
-    let mut uses_immediates = false;
-    for (h, var) in module.global_variables.iter() {
-        if ep_info[h].is_empty() {
-            continue;
-        }
-        if var.space == naga::AddressSpace::Immediate {
-            uses_immediates = true;
-        }
-        let Some(rb) = var.binding else { continue };
-        if rb.group == HEAP_GROUP {
-            heap_bindings_used |= 1 << rb.binding;
-        }
-    }
+    let heap_bindings_used = crate::heap_used(&module, |h| !ep_info[h].is_empty());
+    let uses_immediates = module.global_variables.iter().any(|(h, v)| v.space == naga::AddressSpace::Immediate && !ep_info[h].is_empty());
     Ok(Output {
         words,
         roots: m.entry_point_roots(stage, &name)?,
@@ -365,6 +363,8 @@ mod tests {
                 c += textureSample(mx_tex3d[d.i], s, vec3<f32>(uv, 0.5));
                 c += vec4<f32>(textureSampleCompare(mx_texdepth[d.i], mx_samplers_cmp[d.i], uv, 0.5));
                 c += vec4<f32>(textureLoad(mx_tex2d_u32[d.i], vec2<i32>(0), 0));
+                c += vec4<f32>(f32(mx_buffers[d.i].w[1]));
+                mx_rw_buffers[d.i].w[0] = 1u;
                 return c;
             }",
         )

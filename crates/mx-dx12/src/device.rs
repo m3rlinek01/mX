@@ -129,6 +129,9 @@ impl Instance {
 pub(crate) struct Caps {
     pub shader_model: ShaderModel,
     pub ray_query: bool,
+    /// Enhanced barriers (`ID3D12GraphicsCommandList7::Barrier`), unless
+    /// `MX_DX12_LEGACY_BARRIERS` is set.
+    pub enhanced_barriers: bool,
 }
 
 pub(crate) struct AdapterInner {
@@ -203,6 +206,8 @@ impl Adapter {
         };
         let options5 = feature(&device, D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS5::default()).unwrap_or_default();
         let ray_query = options5.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_1.0 && shader_model >= ShaderModel::V6_5;
+        let options12 = feature(&device, D3D12_FEATURE_D3D12_OPTIONS12, D3D12_FEATURE_DATA_D3D12_OPTIONS12::default()).unwrap_or_default();
+        let enhanced_barriers = options12.EnhancedBarriersSupported.as_bool() && std::env::var_os("MX_DX12_LEGACY_BARRIERS").is_none();
         let name_len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
         let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
         let device_type = if software {
@@ -225,7 +230,11 @@ impl Adapter {
             device,
             compiler: compiler.clone(),
             info,
-            caps: Caps { shader_model, ray_query },
+            caps: Caps {
+                shader_model,
+                ray_query,
+                enhanced_barriers,
+            },
         })))
     }
 
@@ -240,17 +249,89 @@ impl Adapter {
             max_texture_array_layers: D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION,
             max_bindless_textures: (MAX_VIEW_HEAP - 1 - BLOCK * BLOCKS).min(500_000),
             max_bindless_samplers: mx_shader::hlsl::SAMPLER_HEAP_SIZE,
+            // (two descriptors per buffer view; `request_device` fits both kinds in the heap)
+            max_bindless_buffers: 200_000,
+            // (a raw view starts on 16 bytes; 256 keeps every backend's rule)
+            buffer_view_offset_alignment: 256,
             // (the root signature's 64 DWORDs: 3 special constants, 2 heap tables, 7 group
             // tables, 32 for immediates)
             max_immediate_size: 128,
             max_vertex_buffers: 8,
             max_root_buffers: 13,
             max_color_attachments: 8,
+            max_buffer_size: 1 << 31,
+            max_storage_buffer_binding_size: 1 << 31,
+            min_uniform_buffer_offset_alignment: 256,
+            min_storage_buffer_offset_alignment: 256,
         }
+    }
+
+    /// The GPU's memory: its dedicated video memory and the budget DXGI gives the program.
+    pub fn memory_info(&self) -> Option<t::AdapterMemory> {
+        use windows::Win32::Graphics::Dxgi::{DXGI_MEMORY_SEGMENT_GROUP_LOCAL, IDXGIAdapter3};
+        use windows::core::Interface;
+        // SAFETY: plain queries of a live adapter.
+        unsafe {
+            let desc = self.0.raw.GetDesc1().ok()?;
+            let budget = self.0.raw.cast::<IDXGIAdapter3>().ok().and_then(|a| {
+                let mut info = windows::Win32::Graphics::Dxgi::DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).ok().map(|()| info.Budget)
+            });
+            Some(t::AdapterMemory {
+                dedicated_bytes: desc.DedicatedVideoMemory as u64,
+                budget_bytes: budget,
+            })
+        }
+    }
+
+    /// Whether `format` renders and resolves with `samples` samples per pixel.
+    pub fn supports_msaa(&self, format: t::TextureFormat, samples: u32) -> bool {
+        if samples <= 1 {
+            return true;
+        }
+        let data = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+            Format: crate::conv::format(format),
+            SampleCount: samples,
+            ..Default::default()
+        };
+        feature(&self.0.device, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, data).is_some_and(|d| d.NumQualityLevels > 0)
+    }
+
+    /// Textures a pipeline may read through root bindings (on OpenGL, through anything: texture
+    /// units): (vertex stage, fragment stage, the pipeline together).
+    pub fn texture_units(&self) -> (u32, u32, u32) {
+        (128, 128, 256)
+    }
+
+    /// Indexed draws with a base vertex (not below OpenGL 3.2 / ES 3.2).
+    pub fn supports_base_vertex(&self) -> bool {
+        true
     }
 
     /// Every Direct3D 12 device samples BC formats.
     pub fn supports_bc(&self) -> bool {
+        true
+    }
+
+    /// Compute shaders: every bindless device has them.
+    pub fn supports_compute(&self) -> bool {
+        true
+    }
+
+    /// How many storage buffers the vertex and fragment stages may read as root bindings
+    /// (any number through the heap).
+    pub fn storage_buffers_per_stage(&self) -> (u32, u32) {
+        (64, 64)
+    }
+
+    /// Whether this GPU runs on the bound tier: the heap bound slot by slot at each draw,
+    /// heap accesses indexed by immediates or constants only.
+    pub fn is_bound_tier(&self) -> bool {
+        false
+    }
+    /// GPU-driven draw counts (`Device::create_indirect_draws`): `ExecuteIndirect` takes a
+    /// count buffer on every Direct3D 12 device.
+    pub fn supports_indirect_count(&self) -> bool {
         true
     }
 
@@ -274,6 +355,8 @@ impl Adapter {
         let limits = self.limits();
         let textures = desc.bindless_textures.min(limits.max_bindless_textures).max(1);
         let samplers = desc.bindless_samplers.min(limits.max_bindless_samplers).max(1);
+        let room = (MAX_VIEW_HEAP - 1 - BLOCK * BLOCKS).saturating_sub(textures) / 2;
+        let buffers = desc.bindless_buffers.min(limits.max_bindless_buffers).min(room).max(1);
         let device = a.device.clone();
         let qdesc = D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -288,7 +371,7 @@ impl Adapter {
         }
         // SAFETY: as above.
         let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.map_err(|e| hr_err("fence", e))?;
-        let views = Views::new(&device, textures)?;
+        let views = Views::new(&device, textures, buffers)?;
         // the heap group's sampler index buffer: sampler heap slot i at index i
         let identity: Vec<u32> = (0..mx_shader::hlsl::SAMPLER_HEAP_SIZE).collect();
         let identity_buffer = crate::resource::upload_buffer(&device, bytes_of_u32(&identity), "mX heap sampler indices")?;
@@ -332,7 +415,7 @@ impl Adapter {
             queue,
             fence,
             views,
-            heap: Mutex::new(Heap::new(textures, samplers)),
+            heap: Mutex::new(Heap::new(textures, samplers, buffers)),
             cpu: Mutex::new(cpu),
             last_submitted: AtomicU64::new(0),
             completed: AtomicU64::new(0),
@@ -342,12 +425,15 @@ impl Adapter {
             lists: Mutex::new(Vec::new()),
             compiler: a.compiler.clone(),
             shader_model: a.caps.shader_model,
+            enhanced_barriers: a.caps.enhanced_barriers,
             info: a.info.clone(),
             limits: t::Limits {
                 max_bindless_textures: textures,
                 max_bindless_samplers: samplers,
+                max_bindless_buffers: buffers,
                 ..limits
-            },
+            }
+            .capped(desc.limits.as_ref()),
             ray_query: a.caps.ray_query,
             timestamp_period: if frequency > 0 { (1e9 / frequency as f64) as f32 } else { 1.0 },
             zero_buffer,
@@ -355,6 +441,7 @@ impl Adapter {
             _identity_buffer: identity_buffer,
             shader_cache: Mutex::new(HashMap::new()),
             mips: Mutex::new(crate::command::MipTools::default()),
+            indirect: Mutex::new(None),
         });
         Ok((Device { shared: shared.clone() }, Queue { shared }))
     }
@@ -374,14 +461,21 @@ pub struct DeviceDescriptor<'a> {
     pub bindless_textures: u32,
     /// Samplers the heap holds at once (at most 2048 on Direct3D 12).
     pub bindless_samplers: u32,
+    /// Buffer views the heap holds at once.
+    pub bindless_buffers: u32,
+    /// Limits the device keeps to, where lower than the adapter's (a weaker chip's, to
+    /// test on); None: the adapter's.
+    pub limits: Option<t::Limits>,
 }
 
 impl Default for DeviceDescriptor<'_> {
     fn default() -> Self {
         DeviceDescriptor {
+            limits: None,
             label: None,
             bindless_textures: 1 << 16,
             bindless_samplers: 2048,
+            bindless_buffers: 1 << 15,
         }
     }
 }
@@ -407,6 +501,8 @@ pub(crate) struct Recording {
     scratch: Vec<(Buffer, u64)>,
     /// A storage write happened since the last UAV barrier.
     pub uav_dirty: bool,
+    /// The heap's `buffer_generation` whose buffer states this list last applied (0: none).
+    pub heap_buffers_applied: u64,
     pub closed: bool,
     pub shared: Arc<Shared>,
 }
@@ -440,12 +536,13 @@ impl Recording {
         unsafe { list.SetDescriptorHeaps(&[Some(shared.views.view_heap.clone()), Some(shared.views.sampler_heap.clone())]) };
         Recording {
             lists: Some((alloc, list)),
-            track: Tracker::default(),
+            track: Tracker::new(shared.enhanced_barriers),
             keep: Vec::new(),
             blocks: Vec::new(),
             block_used: BLOCK,
             scratch: Vec::new(),
             uav_dirty: false,
+            heap_buffers_applied: 0,
             closed: false,
             shared: shared.clone(),
         }
@@ -629,6 +726,8 @@ pub(crate) struct Shared {
     ring: Mutex<Ring>,
     lists: Mutex<Vec<ListPair>>,
     pub compiler: Arc<Compiler>,
+    /// Barriers are recorded as enhanced barriers (see `track`).
+    pub enhanced_barriers: bool,
     pub shader_model: ShaderModel,
     pub info: t::AdapterInfo,
     pub limits: t::Limits,
@@ -640,6 +739,8 @@ pub(crate) struct Shared {
     /// Compiled shaders by (HLSL, entry point, profile), as wgpu-hal's cache.
     pub shader_cache: Mutex<ShaderCache>,
     pub mips: Mutex<crate::command::MipTools>,
+    /// The compute pipeline that lays out GPU-driven draw arguments for `ExecuteIndirect`.
+    pub indirect: Mutex<Option<crate::ComputePipeline>>,
 }
 
 impl Shared {
@@ -752,7 +853,7 @@ impl Shared {
         if done == u64::MAX {
             // SAFETY: a plain getter.
             let reason = unsafe { self.device.GetDeviceRemovedReason() };
-            return Err(Error::Device(format!("device removed: {reason:?}")));
+            return Err(Error::DeviceLost(format!("device removed: {reason:?}")));
         }
         let finished: Vec<Retired> = {
             let mut in_flight = self.in_flight.lock();
@@ -811,9 +912,24 @@ impl Device {
         self.shared.wait_idle()
     }
 
+    /// BC texture compression (as the adapter's `supports_bc`).
+    pub fn supports_bc(&self) -> bool {
+        true
+    }
+
+    /// Timestamp queries (as the adapter's `supports_timestamps`).
+    pub fn supports_timestamps(&self) -> bool {
+        true
+    }
+
     /// Texture views in the heap right now.
     pub fn bindless_textures_in_use(&self) -> usize {
         self.shared.heap.lock().textures_in_use()
+    }
+
+    /// Buffer views in the heap right now.
+    pub fn bindless_buffers_in_use(&self) -> usize {
+        self.shared.heap.lock().buffers_in_use()
     }
 
     /// The `ID3D12Device`, for interop (DLSS, FSR 3, OpenXR).

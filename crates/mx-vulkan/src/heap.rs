@@ -1,5 +1,6 @@
 //! The bindless heap: descriptor set 0, one `UPDATE_AFTER_BIND | PARTIALLY_BOUND` array per
-//! heap binding, slot allocation with deferred reuse.
+//! texture and sampler binding of the heap and one array of storage buffers that every buffer
+//! view of a shader aliases, slot allocation with deferred reuse.
 
 use ash::vk;
 use mx_shader::heap;
@@ -54,27 +55,34 @@ pub(crate) struct Heap {
     pub set: vk::DescriptorSet,
     textures: Slots,
     samplers: Slots,
+    buffers: Slots,
     in_use: usize,
+    buffers_in_use: usize,
 }
 
+/// The descriptor bindings of the heap's set: textures, samplers, then the buffers.
+const SET_BINDINGS: u32 = heap::BUFFERS + 1;
+
 impl Heap {
-    /// The heap with up to `textures` / `samplers` slots: fewer where the driver says a
+    /// The heap with up to `textures` / `samplers` / `buffers` slots: fewer where the driver says a
     /// layout that large is not supported (above `maxPerSetDescriptors` a layout is valid only
     /// where `vkGetDescriptorSetLayoutSupport` says so). `portability`: MoltenVK, whose answer
     /// only compares with its `maxPerSetDescriptors` (1212) although its argument buffers
     /// take far larger arrays: the size asked for is kept there.
-    pub fn new(device: &ash::Device, textures: u32, samplers: u32, update_unused_while_pending: bool, portability: bool) -> Result<Heap> {
+    pub fn new(device: &ash::Device, textures: u32, samplers: u32, buffers: u32, update_unused_while_pending: bool, portability: bool) -> Result<Heap> {
         let mut flags = vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
         if update_unused_while_pending {
             flags |= vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING;
         }
-        let bindings_for = |textures: u32, samplers: u32| -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
-            (0..heap::COUNT)
+        let bindings_for = |textures: u32, samplers: u32, buffers: u32| -> Vec<vk::DescriptorSetLayoutBinding<'static>> {
+            (0..SET_BINDINGS)
                 .map(|b| {
                     let (ty, count) = if heap::is_texture(b) {
                         (vk::DescriptorType::SAMPLED_IMAGE, textures)
-                    } else {
+                    } else if heap::is_sampler(b) {
                         (vk::DescriptorType::SAMPLER, samplers)
+                    } else {
+                        (vk::DescriptorType::STORAGE_BUFFER, buffers)
                     };
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(b)
@@ -84,9 +92,9 @@ impl Heap {
                 })
                 .collect()
         };
-        let binding_flags = vec![flags; heap::COUNT as usize];
-        let supported = |textures: u32, samplers: u32| -> bool {
-            let bindings = bindings_for(textures, samplers);
+        let binding_flags = vec![flags; SET_BINDINGS as usize];
+        let supported = |textures: u32, samplers: u32, buffers: u32| -> bool {
+            let bindings = bindings_for(textures, samplers, buffers);
             let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
             let info = vk::DescriptorSetLayoutCreateInfo::default()
                 .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
@@ -97,28 +105,30 @@ impl Heap {
             unsafe { device.get_descriptor_set_layout_support(&info, &mut support) };
             support.supported != 0
         };
-        let (mut textures, mut samplers) = (textures, samplers);
-        if !supported(textures, samplers) {
+        let (mut textures, mut samplers, mut buffers) = (textures, samplers, buffers);
+        if !supported(textures, samplers, buffers) {
             if portability {
-                log::info!("mX: MoltenVK reports the heap layout ({textures} textures) as unsupported by its maxPerSetDescriptors; kept, as its argument buffers take it");
+                log::info!("mX: MoltenVK reports the heap layout ({textures} textures, {buffers} buffers) as unsupported by its maxPerSetDescriptors; kept, as its argument buffers take it");
             } else {
-                while !supported(textures, samplers) {
+                while !supported(textures, samplers, buffers) {
                     if textures <= 256 {
                         return Err(crate::Error::Unsupported(format!("a bindless heap of {textures} textures")));
                     }
                     textures /= 2;
+                    buffers = buffers.min(textures).max(64);
                     samplers = samplers.min(textures).max(16);
                 }
-                log::info!("mX: the driver takes a heap of {textures} textures and {samplers} samplers");
+                log::info!("mX: the driver takes a heap of {textures} textures, {samplers} samplers and {buffers} buffers");
             }
         }
-        let bindings = bindings_for(textures, samplers);
+        let bindings = bindings_for(textures, samplers, buffers);
         let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
         let info = vk::DescriptorSetLayoutCreateInfo::default()
             .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
             .bindings(&bindings)
             .push_next(&mut flags_info);
         let tex_bindings = heap::SAMPLERS;
+        debug_assert_eq!((heap::SAMPLERS_CMP, heap::BUFFERS), (heap::SAMPLERS + 1, heap::SAMPLERS + 2));
         let sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
@@ -126,7 +136,11 @@ impl Heap {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: samplers * (heap::COUNT - tex_bindings),
+                descriptor_count: samplers * 2,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: buffers,
             },
         ];
         // SAFETY: plain creation of the heap's layout, pool and set.
@@ -151,14 +165,16 @@ impl Heap {
                 set,
                 textures: Slots::new(textures),
                 samplers: Slots::new(samplers),
+                buffers: Slots::new(buffers),
                 in_use: 0,
+                buffers_in_use: 0,
             })
         }
     }
 
-    /// The slots the heap has: (textures, samplers).
-    pub fn capacity(&self) -> (u32, u32) {
-        (self.textures.capacity, self.samplers.capacity)
+    /// The slots the heap has: (textures, samplers, buffers).
+    pub fn capacity(&self) -> (u32, u32, u32) {
+        (self.textures.capacity, self.samplers.capacity, self.buffers.capacity)
     }
 
     /// Put a view in the heap: written into every heap binding in `bindings` (bit per
@@ -208,10 +224,37 @@ impl Heap {
         self.samplers.deferred.push((after, slot));
     }
 
+    /// Put `range` bytes of `buffer` from `offset` in the heap, as a storage buffer.
+    pub fn add_buffer(&mut self, device: &ash::Device, buffer: vk::Buffer, offset: u64, range: u64) -> Result<u32> {
+        let slot = self.buffers.alloc("buffers")?;
+        let info = [vk::DescriptorBufferInfo::default().buffer(buffer).offset(offset).range(range)];
+        let write = [vk::WriteDescriptorSet::default()
+            .dst_set(self.set)
+            .dst_binding(heap::BUFFERS)
+            .dst_array_element(slot)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&info)];
+        // SAFETY: as in `add_texture`.
+        unsafe { device.update_descriptor_sets(&write, &[]) };
+        self.buffers_in_use += 1;
+        Ok(slot)
+    }
+
+    /// Take a buffer view out of the heap. Its slot is reused once submission `after` is done.
+    pub fn remove_buffer(&mut self, slot: u32, after: u64) {
+        self.buffers.deferred.push((after, slot));
+        self.buffers_in_use -= 1;
+    }
+
+    pub fn buffers_in_use(&self) -> usize {
+        self.buffers_in_use
+    }
+
     /// Everything released before submission `completed` finished is free again.
     pub fn reclaim(&mut self, completed: u64) {
         self.textures.reclaim(completed);
         self.samplers.reclaim(completed);
+        self.buffers.reclaim(completed);
     }
 
     pub fn textures_in_use(&self) -> usize {

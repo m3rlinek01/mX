@@ -70,6 +70,16 @@ impl Buffer {
         Ok(f(bytes))
     }
 
+    /// Read the buffer's contents now, without waiting: the caller knows the submissions
+    /// that wrote it are done (`Device::is_done`), as after wgpu's `map_async`. Needs `MAP_READ`.
+    pub fn map_read_now<R>(&self, range: Range<u64>, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        assert!(self.0.usage.contains(t::BufferUsages::MAP_READ), "map_read on a buffer without MAP_READ");
+        let p = self.mapped(&range, "map_read");
+        // SAFETY: host-visible, coherent, in range, and the GPU is idle.
+        let bytes = unsafe { std::slice::from_raw_parts(p, (range.end - range.start) as usize) };
+        Ok(f(bytes))
+    }
+
     /// Write the buffer's contents from the CPU. Waits until the GPU has finished all
     /// submitted work first. Needs `MAP_WRITE`.
     pub fn map_write<R>(&self, range: Range<u64>, f: impl FnOnce(&mut [u8]) -> R) -> Result<R> {
@@ -99,6 +109,69 @@ impl Buffer {
     /// The `VkBuffer`, for interop.
     pub fn raw(&self) -> vk::Buffer {
         self.0.raw
+    }
+
+    /// A range of the buffer in the bindless heap ([`BufferView::index`]). Needs `STORAGE`.
+    pub fn create_view(&self, desc: &t::BufferViewDescriptor<'_>) -> Result<BufferView> {
+        let shared = &self.0.shared;
+        let size = desc.resolve(self.size(), self.usage(), &shared.limits);
+        if size > shared.caps.max_storage_buffer_range {
+            return Err(Error::Unsupported(format!(
+                "a buffer view of {size} bytes (the device's maxStorageBufferRange is {})",
+                shared.caps.max_storage_buffer_range
+            )));
+        }
+        let slot = shared.heap.lock().add_buffer(&shared.raw, self.0.raw, desc.offset, size)?;
+        Ok(BufferView(Arc::new(BufferViewInner {
+            buffer: self.clone(),
+            offset: desc.offset,
+            size,
+            writable: desc.writable,
+            slot,
+        })))
+    }
+}
+
+pub(crate) struct BufferViewInner {
+    pub buffer: Buffer,
+    pub offset: u64,
+    pub size: u64,
+    pub writable: bool,
+    slot: u32,
+}
+
+impl Drop for BufferViewInner {
+    fn drop(&mut self) {
+        let shared = &self.buffer.0.shared;
+        shared.heap.lock().remove_buffer(self.slot, shared.release_after());
+    }
+}
+
+/// A range of a buffer in the bindless heap.
+#[derive(Clone)]
+pub struct BufferView(pub(crate) Arc<BufferViewInner>);
+
+impl BufferView {
+    /// The view's index in the heap: `mx_buffers[i]`, `mx_rw_buffers[i]` or a shader's own
+    /// buffer view in WGSL.
+    pub fn index(&self) -> u32 {
+        self.0.slot
+    }
+
+    pub fn buffer(&self) -> &Buffer {
+        &self.0.buffer
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.0.offset
+    }
+
+    pub fn size(&self) -> u64 {
+        self.0.size
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.0.writable
     }
 }
 
@@ -177,6 +250,13 @@ impl Texture {
     }
     pub fn usage(&self) -> t::TextureUsages {
         self.0.usage
+    }
+
+    /// The image's memory and its offset in it (None for a wrapped image), for interop
+    /// (Streamline names both). Every image of mX's rests in `GENERAL` between commands.
+    pub fn raw_memory(&self) -> Option<(vk::DeviceMemory, u64)> {
+        // SAFETY: the memory outlives the texture's use; only its handle is read.
+        self.0.alloc.as_ref().map(|a| (unsafe { a.memory() }, a.offset()))
     }
 
     pub(crate) fn layers(&self) -> u32 {
@@ -700,5 +780,48 @@ pub(crate) fn buffer_image_region(at: &t::TexelCopyTextureInfo<'_, Texture>, lay
         },
         image_offset: conv::origin(at.origin, is_3d),
         image_extent: conv::extent(clamp_to_mip(tex, at.mip_level, at.origin, size), is_3d),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// GPU-driven draws
+
+/// Where a batch of GPU-driven draws reads its arguments (see `encode_indirect_draws`).
+#[derive(Clone)]
+pub(crate) struct IndirectSource {
+    pub args: Buffer,
+    pub args_offset: u64,
+    pub count: Buffer,
+    pub count_offset: u64,
+    pub index: Option<(Buffer, u64, t::IndexFormat)>,
+}
+
+pub(crate) struct IndirectDrawsInner {
+    pub max_draws: u32,
+    pub indexed: bool,
+    pub source: parking_lot::Mutex<Option<IndirectSource>>,
+}
+
+/// A batch of draws whose arguments and count the GPU writes (see `t::IndirectDrawsDescriptor`).
+#[derive(Clone)]
+pub struct IndirectDraws(pub(crate) Arc<IndirectDrawsInner>);
+
+impl IndirectDraws {
+    pub fn max_draws(&self) -> u32 {
+        self.0.max_draws
+    }
+}
+
+impl Device {
+    /// A batch of GPU-driven draws. Needs `drawIndirectCount` (`Adapter::supports_indirect_count`).
+    pub fn create_indirect_draws(&self, desc: &t::IndirectDrawsDescriptor<'_>) -> Result<IndirectDraws> {
+        if !self.shared.caps.draw_indirect_count {
+            return Err(Error::Unsupported("GPU-driven draw counts (drawIndirectCount)".into()));
+        }
+        Ok(IndirectDraws(Arc::new(IndirectDrawsInner {
+            max_draws: desc.max_draws,
+            indexed: desc.indexed,
+            source: parking_lot::Mutex::new(None),
+        })))
     }
 }

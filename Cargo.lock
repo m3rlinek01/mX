@@ -78,6 +78,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -532,6 +538,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "glow"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29038e1c483364cc6bb3cf78feee1816002e127c331a1eec55a4d202b9e1adb5"
+dependencies = [
+ "js-sys",
+ "slotmap",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "gpu-allocator"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -708,6 +726,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "khronos-egl"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6aae1df220ece3c0ada96b8153459b67eebe9ae9212258bb0134ae60416fdf76"
+dependencies = [
+ "libc",
+ "libloading",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -814,14 +842,34 @@ name = "mx"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "mx-dx11",
  "mx-dx12",
+ "mx-gl",
  "mx-metal",
+ "mx-noop",
  "mx-shader",
  "mx-types",
  "mx-vulkan",
+ "parking_lot",
  "png",
  "pollster",
+ "raw-window-handle",
+ "thiserror 2.0.21",
  "winit",
+]
+
+[[package]]
+name = "mx-dx11"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "mx-shader",
+ "mx-types",
+ "parking_lot",
+ "raw-window-handle",
+ "thiserror 2.0.21",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
@@ -839,6 +887,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mx-gl"
+version = "0.1.0"
+dependencies = [
+ "glow",
+ "khronos-egl",
+ "libloading",
+ "log",
+ "mx-shader",
+ "mx-types",
+ "parking_lot",
+ "raw-window-handle",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "mx-metal"
 version = "0.1.0"
 dependencies = [
@@ -852,6 +915,17 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "objc2-ui-kit 0.3.2",
+ "parking_lot",
+ "raw-window-handle",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "mx-noop"
+version = "0.1.0"
+dependencies = [
+ "mx-shader",
+ "mx-types",
  "parking_lot",
  "raw-window-handle",
  "thiserror 2.0.21",
@@ -883,6 +957,22 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.13.2",
  "bytemuck",
+]
+
+[[package]]
+name = "mx-upscale"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "libc",
+ "log",
+ "mx",
+ "objc2 0.6.5",
+ "objc2-metal 0.3.2",
+ "parking_lot",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
@@ -956,8 +1046,6 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "30.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd0dd362bf26c0ffdd143df6da66a25d287e196eff482f117771010b207ad163"
 dependencies = [
  "arrayvec",
  "bit-set 0.10.0",
@@ -1756,6 +1844,15 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slotmap"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
+dependencies = [
+ "version_check",
+]
 
 [[package]]
 name = "smallvec"

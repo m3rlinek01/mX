@@ -1,16 +1,34 @@
 //! WGSL through naga to MSL, SPIR-V and HLSL.
 //!
 //! Every shader gets the bindless heap: [`PRELUDE`] is appended to the source, so its names
-//! (`mx_tex2d`, `mx_samplers`, ...) are usable anywhere. WGSL group numbers are virtual: the
-//! backend writers place each `(group, binding)` where their API wants it.
+//! (`mx_tex2d`, `mx_samplers`, `mx_buffers`, ...) are usable anywhere. WGSL group numbers are
+//! virtual: the backend writers place each `(group, binding)` where their API wants it.
+//!
+//! Buffers are in the heap too. A buffer view's index reads it through `mx_buffers[i]` (words)
+//! or through a typed view the shader declares itself in the heap group:
+//!
+//! ```wgsl
+//! struct Lights { l: array<Light> }
+//! @group(7) @binding(16) var<storage, read> lights: binding_array<Lights>;
+//! ```
+//!
+//! Every typed view (bindings [`heap::FIRST_BUFFER_VIEW`]`..=`[`heap::LAST_BUFFER_VIEW`]) is
+//! the same array of buffers seen with another element type, as `ByteAddressBuffer`s and
+//! buffer device addresses are in other engines.
 
 use std::fmt;
 
 pub use naga;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
+pub mod bound;
+#[cfg(feature = "glsl")]
+pub mod glsl;
 #[cfg(feature = "hlsl")]
 pub mod hlsl;
+/// HLSL shader model 5.0, the Direct3D 11 backend's (the bound tier).
+#[cfg(feature = "hlsl")]
+pub mod hlsl11;
 #[cfg(feature = "msl")]
 pub mod msl;
 #[cfg(feature = "spirv")]
@@ -29,12 +47,30 @@ pub mod heap {
     pub const TEX_2D_U32: u32 = 5;
     pub const SAMPLERS: u32 = 6;
     pub const SAMPLERS_CMP: u32 = 7;
-    /// How many bindings the heap has.
-    pub const COUNT: u32 = 8;
+    /// `mx_buffers`: every buffer view, read as words.
+    pub const BUFFERS: u32 = 8;
+    /// `mx_rw_buffers`: every buffer view, read and written as words.
+    pub const RW_BUFFERS: u32 = 9;
+    /// How many bindings the prelude declares.
+    pub const COUNT: u32 = 10;
+    /// The first binding a shader may give its own typed view of the buffer heap.
+    pub const FIRST_BUFFER_VIEW: u32 = 16;
+    /// The last one.
+    pub const LAST_BUFFER_VIEW: u32 = 63;
 
-    /// Whether a heap binding holds textures (else samplers).
+    /// Whether a heap binding holds textures.
     pub const fn is_texture(binding: u32) -> bool {
         binding < SAMPLERS
+    }
+
+    /// Whether a heap binding holds samplers.
+    pub const fn is_sampler(binding: u32) -> bool {
+        binding == SAMPLERS || binding == SAMPLERS_CMP
+    }
+
+    /// Whether a heap binding is a view of the buffer heap.
+    pub const fn is_buffer(binding: u32) -> bool {
+        binding == BUFFERS || binding == RW_BUFFERS || (binding >= FIRST_BUFFER_VIEW && binding <= LAST_BUFFER_VIEW)
     }
 }
 
@@ -50,6 +86,9 @@ pub const PRELUDE: &str = "
 @group(7) @binding(5) var mx_tex2d_u32: binding_array<texture_2d<u32>>;
 @group(7) @binding(6) var mx_samplers: binding_array<sampler>;
 @group(7) @binding(7) var mx_samplers_cmp: binding_array<sampler_comparison>;
+struct MxWords { w: array<u32> }
+@group(7) @binding(8) var<storage, read> mx_buffers: binding_array<MxWords>;
+@group(7) @binding(9) var<storage, read_write> mx_rw_buffers: binding_array<MxWords>;
 ";
 
 /// The largest group a root binding may use.
@@ -104,8 +143,18 @@ pub struct Module {
     /// Two of them can share a (group, binding) when no entry point uses both, as WGSL
     /// allows; [`Module::entry_point_roots`] tells them apart.
     pub roots: Vec<RootBinding>,
+    /// The views of the buffer heap the module declares (the prelude's two and the shader's
+    /// own), sorted by binding.
+    pub heap_buffers: Vec<HeapBuffer>,
     /// The variable behind each root binding.
     root_vars: Vec<(naga::Handle<naga::GlobalVariable>, RootBinding)>,
+}
+
+/// One view of the buffer heap: a `binding_array` of storage buffers in the heap group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HeapBuffer {
+    pub binding: u32,
+    pub read_only: bool,
 }
 
 impl fmt::Debug for Module {
@@ -114,7 +163,7 @@ impl fmt::Debug for Module {
     }
 }
 
-fn validator() -> Validator {
+pub(crate) fn validator() -> Validator {
     Validator::new(ValidationFlags::all(), Capabilities::all())
 }
 
@@ -133,11 +182,13 @@ impl Module {
         })?;
         let root_vars = reflect_roots(label, &module)?;
         let roots = root_vars.iter().map(|&(_, r)| r).collect();
+        let heap_buffers = reflect_heap_buffers(label, &module)?;
         Ok(Module {
             label: label.into(),
             module,
             info,
             roots,
+            heap_buffers,
             root_vars,
         })
     }
@@ -156,6 +207,47 @@ impl Module {
             label: self.label.clone(),
             name: name.unwrap_or("<the only one>").into(),
             stage,
+        })
+    }
+
+    /// The heap bindings entry point `name` of `stage` uses, a bit per binding (`heap::*` and
+    /// the shader's own buffer views).
+    pub fn entry_point_heap(&self, stage: naga::ShaderStage, name: &str) -> Result<u64, ShaderError> {
+        let index = self
+            .module
+            .entry_points
+            .iter()
+            .position(|e| e.stage == stage && e.name == name)
+            .ok_or_else(|| ShaderError::NoEntryPoint {
+                label: self.label.clone(),
+                name: name.into(),
+                stage,
+            })?;
+        let info = self.info.get_entry_point(index);
+        Ok(heap_used(&self.module, |h| !info[h].is_empty()))
+    }
+
+    /// The bounds checks this module is written with. A module that reads buffers through the
+    /// heap is a bindless one: as for heap textures, indices and offsets are the renderer's
+    /// responsibility and buffer accesses are unchecked (the drivers' robust access still
+    /// applies where the device has it). Other modules keep wgpu-hal's checks, so they draw
+    /// what they drew under wgpu.
+    pub fn bounds_check_policies(&self) -> naga::proc::BoundsCheckPolicies {
+        let mut p = bounds_check_policies();
+        if self.uses_heap_buffers() {
+            p.buffer = naga::proc::BoundsCheckPolicy::Unchecked;
+        }
+        p
+    }
+
+    /// Whether any entry point reads or writes a buffer through the heap.
+    pub fn uses_heap_buffers(&self) -> bool {
+        (0..self.module.entry_points.len()).any(|i| {
+            let info = self.info.get_entry_point(i);
+            self.module
+                .global_variables
+                .iter()
+                .any(|(h, v)| !info[h].is_empty() && v.binding.is_some_and(|b| b.group == HEAP_GROUP && heap::is_buffer(b.binding)))
         })
     }
 
@@ -248,6 +340,94 @@ fn reflect_roots(label: &str, module: &naga::Module) -> Result<Vec<(naga::Handle
     Ok(roots)
 }
 
+/// The heap bindings of the globals `used` keeps, a bit per binding.
+pub fn heap_used(module: &naga::Module, used: impl Fn(naga::Handle<naga::GlobalVariable>) -> bool) -> u64 {
+    module
+        .global_variables
+        .iter()
+        .filter(|&(h, _)| used(h))
+        .filter_map(|(_, v)| v.binding)
+        // (the bound tier's slot globals, `bound::slot_binding`, are not heap arrays)
+        .filter(|b| b.group == HEAP_GROUP && b.binding <= heap::LAST_BUFFER_VIEW)
+        .fold(0, |bits, b| bits | 1 << b.binding)
+}
+
+fn reflect_heap_buffers(label: &str, module: &naga::Module) -> Result<Vec<HeapBuffer>, ShaderError> {
+    let layout_err = |message: String| ShaderError::Layout { label: label.into(), message };
+    let mut views = Vec::new();
+    for (_, var) in module.global_variables.iter() {
+        let Some(rb) = var.binding else { continue };
+        if rb.group != HEAP_GROUP {
+            continue;
+        }
+        let name = var.name.as_deref().unwrap_or("?");
+        let is_view = heap::is_buffer(rb.binding);
+        let prelude = rb.binding < heap::COUNT;
+        if !prelude && !is_view {
+            return Err(layout_err(format!(
+                "`{name}`: heap bindings {}..{} are reserved; give a buffer view a binding in {}..={}",
+                heap::COUNT,
+                heap::FIRST_BUFFER_VIEW,
+                heap::FIRST_BUFFER_VIEW,
+                heap::LAST_BUFFER_VIEW
+            )));
+        }
+        if !is_view {
+            continue;
+        }
+        let naga::AddressSpace::Storage { access } = var.space else {
+            return Err(layout_err(format!("`{name}`: a view of the buffer heap is `var<storage, read>` or `var<storage, read_write>`")));
+        };
+        let naga::TypeInner::BindingArray { base, .. } = module.types[var.ty].inner else {
+            return Err(layout_err(format!("`{name}`: a view of the buffer heap is a `binding_array`")));
+        };
+        if !matches!(module.types[base].inner, naga::TypeInner::Struct { .. }) {
+            return Err(layout_err(format!("`{name}`: the elements of a buffer view are structs")));
+        }
+        if views.iter().any(|v: &HeapBuffer| v.binding == rb.binding) {
+            return Err(layout_err(format!("`{name}`: heap binding {} is declared twice", rb.binding)));
+        }
+        views.push(HeapBuffer {
+            binding: rb.binding,
+            read_only: !access.contains(naga::StorageAccess::STORE),
+        });
+    }
+    reject_heap_array_length(label, module)?;
+    views.sort_by_key(|v| v.binding);
+    Ok(views)
+}
+
+/// `arrayLength` of a heap buffer would need the length of every buffer in the heap passed to
+/// every draw on Metal; a bindless shader keeps its counts in its own data instead.
+fn reject_heap_array_length(label: &str, module: &naga::Module) -> Result<(), ShaderError> {
+    let functions = module.functions.iter().map(|(_, f)| f).chain(module.entry_points.iter().map(|e| &e.function));
+    for f in functions {
+        for (_, expr) in f.expressions.iter() {
+            let naga::Expression::ArrayLength(mut e) = *expr else { continue };
+            loop {
+                match f.expressions[e] {
+                    naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => e = base,
+                    naga::Expression::GlobalVariable(g) => {
+                        let var = &module.global_variables[g];
+                        if var.binding.is_some_and(|b| b.group == HEAP_GROUP && heap::is_buffer(b.binding)) {
+                            return Err(ShaderError::Layout {
+                                label: label.into(),
+                                message: format!(
+                                    "`arrayLength` of a heap buffer (`{}`): keep the count in the buffer or the immediates",
+                                    var.name.as_deref().unwrap_or("?")
+                                ),
+                            });
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ends_in_runtime_array(module: &naga::Module, ty: naga::Handle<naga::Type>) -> bool {
     match &module.types[ty].inner {
         naga::TypeInner::Array { size: naga::ArraySize::Dynamic, .. } => true,
@@ -319,6 +499,39 @@ mod tests {
         let kinds = |stage, name| m.entry_point_roots(stage, name).unwrap().iter().map(|r| (r.group, r.binding, r.kind)).collect::<Vec<_>>();
         assert_eq!(kinds(naga::ShaderStage::Vertex, "vs"), [(3, 0, RootKind::UniformBuffer)]);
         assert_eq!(kinds(naga::ShaderStage::Fragment, "fs"), [(3, 0, RootKind::Texture)]);
+    }
+
+    #[test]
+    fn buffer_views_are_reflected_and_checked() {
+        let m = Module::from_wgsl(
+            "t",
+            "struct L { l: array<vec4<f32>> }\n@group(7) @binding(17) var<storage, read_write> out: binding_array<L>;\n@group(7) @binding(16) var<storage, read> lights: binding_array<L>;\nstruct D { a: u32 }\nvar<immediate> d: D;\n@compute @workgroup_size(1) fn main() { out[d.a].l[0] = lights[d.a].l[1] + vec4<f32>(f32(mx_buffers[d.a].w[2])); }",
+        )
+        .unwrap();
+        let views: Vec<_> = m.heap_buffers.iter().map(|v| (v.binding, v.read_only)).collect();
+        assert_eq!(views, [(heap::BUFFERS, true), (heap::RW_BUFFERS, false), (16, true), (17, false)]);
+        assert!(m.uses_heap_buffers());
+        assert_eq!(m.bounds_check_policies().buffer, naga::proc::BoundsCheckPolicy::Unchecked);
+        let used = m.entry_point_heap(naga::ShaderStage::Compute, "main").unwrap();
+        assert_eq!(used, 1 << heap::BUFFERS | 1 << 16 | 1 << 17);
+
+        let plain = Module::from_wgsl("t", "@compute @workgroup_size(1) fn main() {}").unwrap();
+        assert!(!plain.uses_heap_buffers());
+        assert_eq!(plain.bounds_check_policies(), bounds_check_policies());
+
+        let bad = [
+            // reserved binding
+            "struct L { l: array<u32> }\n@group(7) @binding(12) var<storage, read> x: binding_array<L>;",
+            // not storage
+            "@group(7) @binding(16) var x: binding_array<texture_2d<f32>>;",
+            // elements that are not structs
+            "@group(7) @binding(16) var<storage, read> x: binding_array<array<u32>>;",
+            // arrayLength of a heap buffer
+            "@compute @workgroup_size(1) fn main() { mx_rw_buffers[0].w[0] = arrayLength(&mx_buffers[1].w); }",
+        ];
+        for src in bad {
+            assert!(matches!(Module::from_wgsl("t", src), Err(ShaderError::Layout { .. }) | Err(ShaderError::Validate { .. })), "{src}");
+        }
     }
 
     #[test]

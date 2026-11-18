@@ -83,8 +83,12 @@ fn shader_model_of_dxc(major: u32, minor: u32) -> ShaderModel {
 }
 
 impl Compiler {
-    /// DXC if `dxcompiler.dll` loads, else FXC (as wgpu's `Dx12Compiler::Auto`).
+    /// DXC if `dxcompiler.dll` loads, else FXC (as wgpu's `Dx12Compiler::Auto`);
+    /// `MX_DX12_COMPILER=fxc` asks for FXC (tests of FXC's optimizer).
     pub fn load() -> Result<Compiler, String> {
+        if std::env::var("MX_DX12_COMPILER").is_ok_and(|v| v.eq_ignore_ascii_case("fxc")) {
+            return Self::fxc();
+        }
         match Self::dxc() {
             Ok(c) => Ok(c),
             Err(e) => {

@@ -22,7 +22,7 @@ pub use command::{CommandBuffer, CommandEncoder, ComputePass, RenderPass};
 pub use device::{Adapter, Device, DeviceDescriptor, Instance, Queue, SubmissionIndex};
 pub use pipeline::{ComputePipeline, RenderPipeline, ShaderModule, ShaderModuleDescriptor};
 pub use query::QuerySet;
-pub use resource::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindingResource, Buffer, BufferBinding, BufferInitDescriptor, Sampler, Texture, TextureView};
+pub use resource::{BindGroup, BindGroupDescriptor, BindGroupEntry, BindingResource, Buffer, BufferBinding, BufferInitDescriptor, BufferView, IndirectDraws, Sampler, Texture, TextureView};
 pub use rt::{Blas, Tlas};
 pub use surface::{Surface, SurfaceTexture};
 
@@ -46,6 +46,10 @@ pub enum Error {
     Pipeline { label: String, message: String },
     #[error("the GPU reported an error: {0}")]
     Device(String),
+    /// The GPU is gone (removed, reset, hung): nothing made on this device works any more;
+    /// the device has to be made again.
+    #[error("the GPU was lost: {0}")]
+    DeviceLost(String),
     #[error("surface: {0}")]
     Surface(String),
 }
@@ -78,4 +82,36 @@ pub(crate) type Po<T> = objc2::rc::Retained<objc2::runtime::ProtocolObject<T>>;
 
 pub(crate) fn ns(s: &str) -> objc2::rc::Retained<objc2_foundation::NSString> {
     objc2_foundation::NSString::from_str(s)
+}
+
+/// Objects compare and hash by identity (the same object, not equal contents), as wgpu's do.
+macro_rules! identity {
+    ($($t:ty => |$x:ident| $e:expr;)*) => {$(
+        impl PartialEq for $t {
+            fn eq(&self, o: &Self) -> bool {
+                let a = { let $x = self; $e };
+                let b = { let $x = o; $e };
+                a == b
+            }
+        }
+        impl Eq for $t {}
+        impl std::hash::Hash for $t {
+            fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+                let $x = self;
+                ($e).hash(h)
+            }
+        }
+    )*};
+}
+
+use std::sync::Arc;
+
+identity! {
+    Buffer => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    Texture => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    TextureView => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    Sampler => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    BindGroup => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    Blas => |x| Arc::as_ptr(&x.0) as *const u8 as usize;
+    Device => |x| Arc::as_ptr(&x.shared) as *const u8 as usize;
 }

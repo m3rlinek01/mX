@@ -12,22 +12,30 @@ repository.workspace = true
 [dependencies]
 mx-types.workspace = true
 mx-shader.workspace = true
-
-# (optional everywhere: the `vulkan` feature picks it on any platform, macOS via MoltenVK)
+parking_lot.workspace = true
+thiserror.workspace = true
+raw-window-handle = "0.6"
 mx-vulkan = { workspace = true, optional = true }
+mx-gl = { workspace = true, optional = true }
+mx-noop = { workspace = true, optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 mx-metal.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 mx-dx12.workspace = true
-
-[target.'cfg(not(any(target_vendor = "apple", windows)))'.dependencies]
-mx-vulkan.workspace = true
+mx-dx11.workspace = true
 
 [features]
-# Vulkan as the backend on every platform (on Apple platforms through MoltenVK).
+# Every backend of the platform is in the build, and the program picks one at run time (see the
+# crate's documentation). Metal (Apple) and Direct3D 12 (Windows) come with their platforms;
+# these add Vulkan (on Apple platforms through MoltenVK) and OpenGL / OpenGL ES through EGL
+# (ANGLE on Windows), the bound tier.
+# `noop` adds the no-op device (draws nothing: dedicated servers, tests without a GPU).
+default = ["vulkan", "gl", "noop"]
 vulkan = ["dep:mx-vulkan"]
+gl = ["dep:mx-gl"]
+noop = ["dep:mx-noop"]
 
 [dev-dependencies]
 bytemuck.workspace = true

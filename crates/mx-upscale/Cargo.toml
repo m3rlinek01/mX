@@ -1,0 +1,32 @@
+[package]
+name = "mx-upscale"
+description = "mX: the vendors' upscalers and frame generators (MetalFX, DLSS, FSR 3, XeSS) on mX's devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+categories.workspace = true
+keywords.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+mx = { path = "../mx", default-features = false }
+anyhow = "1"
+log.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-metal = { workspace = true, default-features = false, features = ["std", "MTLCommandBuffer", "MTLCommandQueue", "MTLDevice", "MTLPixelFormat", "MTLResource", "MTLTexture"] }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D12", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Security"] }
+# (the `windows::core::implement` macro in `streamline` expands to code naming this)
+windows-core = { version = "0.62", default-features = false }
+ash = { version = "0.38", default-features = false, features = ["std"] }
+
+[features]
+default = ["vulkan"]
+# DLSS, FSR 3 and XeSS on mX's Vulkan device too (Windows).
+vulkan = ["mx/vulkan"]

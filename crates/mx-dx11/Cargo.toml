@@ -1,0 +1,29 @@
+[package]
+name = "mx-dx11"
+description = "mX: the Direct3D 11 backend (the bound tier)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+mx-types.workspace = true
+mx-shader = { workspace = true, features = ["hlsl"] }
+parking_lot.workspace = true
+thiserror.workspace = true
+log.workspace = true
+raw-window-handle = "0.6"
+windows = { version = "0.62", default-features = false, features = [
+    "std",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+] }
+windows-core = { version = "0.62", default-features = false }

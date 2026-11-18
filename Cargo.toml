@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mx-types", "crates/mx-shader", "crates/mx-metal", "crates/mx-vulkan", "crates/mx-dx12", "crates/mx", "crates/mx-parity", "crates/wgpu-mx"]
+members = ["crates/mx-types", "crates/mx-shader", "crates/mx-metal", "crates/mx-vulkan", "crates/mx-dx12", "crates/mx-dx11", "crates/mx-gl", "crates/mx-noop", "crates/mx", "crates/mx-upscale", "crates/mx-parity", "crates/wgpu-mx"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,9 @@ mx-shader = { path = "crates/mx-shader" }
 mx-metal = { path = "crates/mx-metal" }
 mx-vulkan = { path = "crates/mx-vulkan" }
 mx-dx12 = { path = "crates/mx-dx12" }
+mx-dx11 = { path = "crates/mx-dx11" }
+mx-gl = { path = "crates/mx-gl" }
+mx-noop = { path = "crates/mx-noop" }
 bitflags = "2"
 thiserror = "2"
 log = "0.4"
@@ -31,3 +34,8 @@ bytemuck = { version = "1", features = ["derive"] }
 
 [profile.dev]
 opt-level = 1
+
+# naga with storage-buffer binding arrays in its HLSL writer (the buffer heap on Direct3D 12);
+# see vendor/naga/MX_PATCHES.md.
+[patch.crates-io]
+naga = { path = "vendor/naga" }

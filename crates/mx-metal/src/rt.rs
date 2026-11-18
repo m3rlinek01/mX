@@ -147,6 +147,9 @@ fn primitive_descriptor(
 
 impl Device {
     pub fn create_blas(&self, desc: &t::CreateBlasDescriptor<'_>, sizes: &[t::BlasTriangleGeometrySizeDescriptor]) -> Result<Blas> {
+        if self.shared.bound {
+            return Err(Error::Unsupported("ray queries on a Metal 2 GPU (the bound tier)".into()));
+        }
         if !self.shared.device.supportsRaytracing() {
             return Err(Error::Unsupported("ray tracing".into()));
         }
@@ -170,6 +173,9 @@ impl Device {
     }
 
     pub fn create_tlas(&self, desc: &t::CreateTlasDescriptor<'_>) -> Result<Tlas> {
+        if self.shared.bound {
+            return Err(Error::Unsupported("ray queries on a Metal 2 GPU (the bound tier)".into()));
+        }
         if !self.shared.device.supportsRaytracing() {
             return Err(Error::Unsupported("ray tracing".into()));
         }

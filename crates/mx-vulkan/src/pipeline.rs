@@ -40,6 +40,8 @@ pub(crate) struct PipelineInner {
     pub groups: Vec<Option<Group>>,
     pub immediate_size: u32,
     pub push_stages: vk::ShaderStageFlags,
+    /// A stage may write memory (see `command::SyncState`).
+    pub writes: bool,
     pub label: String,
     shared: Arc<Shared>,
 }
@@ -83,7 +85,8 @@ fn immediate_size(m: &mx_shader::Module) -> u32 {
 
 fn descriptor_type(k: RootKind) -> vk::DescriptorType {
     match k {
-        RootKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
+        // (dynamic: a draw may read it at another offset, see `RenderPass::set_buffer_offset`)
+        RootKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
         RootKind::StorageBuffer { .. } => vk::DescriptorType::STORAGE_BUFFER,
         RootKind::Texture => vk::DescriptorType::SAMPLED_IMAGE,
         RootKind::StorageTexture => vk::DescriptorType::STORAGE_IMAGE,
@@ -106,6 +109,8 @@ struct Stage {
     name: CString,
     stage: vk::ShaderStageFlags,
     roots: Vec<RootBinding>,
+    /// The entry point may write memory: storage buffers or textures, or writable heap buffers.
+    writes: bool,
 }
 
 impl Shared {
@@ -141,12 +146,15 @@ impl Device {
             message: format!("vkCreateShaderModule: {e}"),
         })?;
         let name = CString::new(out.entry_point).expect("entry point names have no NUL");
+        let writes = out.roots.iter().any(|r| matches!(r.kind, RootKind::StorageBuffer { read_only: false } | RootKind::StorageTexture))
+            || m.0.module.heap_buffers.iter().any(|v| !v.read_only && out.heap_bindings_used & (1 << v.binding) != 0);
         Ok((
             Stage {
                 module,
                 name,
                 stage: shader_stage(stage),
                 roots: out.roots,
+                writes,
             },
             out.workgroup_size,
         ))
@@ -212,6 +220,7 @@ impl Device {
             }
             let immediate_size = immediate_size(&desc.vertex.module.0.module).max(desc.fragment.as_ref().map_or(0, |f| immediate_size(&f.module.0.module)));
             let (layout, groups, push_stages) = self.layout(&stages, immediate_size)?;
+            let writes = stages.iter().any(|s| s.writes);
             let raw = match self.graphics_pipeline(desc, &stages, layout) {
                 Ok(p) => p,
                 Err(e) => {
@@ -230,6 +239,7 @@ impl Device {
                 groups,
                 immediate_size,
                 push_stages,
+                writes,
                 label: label.into(),
                 shared: shared.clone(),
             })))
@@ -395,6 +405,7 @@ impl Device {
         let module = stage.module;
         let r = (|| {
             let immediate_size = immediate_size(&desc.module.0.module);
+            let writes = stage.writes;
             let stages = [stage];
             let (layout, groups, push_stages) = self.layout(&stages, immediate_size)?;
             let info = [vk::ComputePipelineCreateInfo::default()
@@ -422,6 +433,7 @@ impl Device {
                 groups,
                 immediate_size,
                 push_stages,
+                writes,
                 label: label.into(),
                 shared: shared.clone(),
             })))

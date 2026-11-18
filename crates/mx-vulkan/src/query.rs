@@ -86,7 +86,7 @@ impl CommandEncoder {
         if set.ty() == t::QueryType::Timestamp && self.shared.caps.portability {
             self.split();
         }
-        self.before();
+        self.before(crate::command::Op::ANY);
         // SAFETY: ranges checked above; the queries were written before (WAIT, as wgpu-hal).
         unsafe {
             self.shared.raw.cmd_copy_query_pool_results(
@@ -102,14 +102,14 @@ impl CommandEncoder {
         };
         self.keep(set);
         self.keep(dst);
-        self.mark_dirty();
+        self.after(crate::command::Op::ANY);
     }
 
     /// A timestamp between the commands before and after.
     pub fn write_timestamp(&mut self, set: &QuerySet, index: u32) {
-        self.before();
+        self.before(crate::command::Op::ANY);
         self.reset_timestamp(set, index);
         self.timestamp(set, index);
-        self.mark_dirty();
+        self.after(crate::command::Op::ANY);
     }
 }

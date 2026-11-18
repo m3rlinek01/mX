@@ -8,11 +8,16 @@
 //! |-------------|-----|
 //! | `0 .. T` | bindless texture slots (`TextureView::index`) |
 //! | `T` | the heap group's sampler index buffer (the identity: entry `i` holds `i`) |
-//! | `T + 1 ..` | blocks of [`BLOCK`] descriptors for root tables, one encoder at a time |
+//! | `T + 1 .. T + 1 + B` | bindless buffer slots (`BufferView::index`) as raw SRVs |
+//! | `T + 1 + B .. T + 1 + 2B` | the same slots as raw UAVs (null for views made read-only) |
+//! | `T + 1 + 2B ..` | blocks of [`BLOCK`] descriptors for root tables, one encoder at a time |
+
+use std::collections::HashMap;
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use crate::{Error, Result, Texture, hr_err};
+use crate::track::Track;
+use crate::{Buffer, Error, Result, Texture, hr_err};
 
 /// Descriptors per root-table block.
 pub const BLOCK: u32 = 1024;
@@ -85,10 +90,12 @@ pub(crate) struct Views {
     pub sampler_inc: u32,
     /// Bindless texture slots (`T`).
     pub textures: u32,
+    /// Bindless buffer slots (`B`).
+    pub buffers: u32,
 }
 
 impl Views {
-    pub fn new(device: &ID3D12Device, textures: u32) -> Result<Views> {
+    pub fn new(device: &ID3D12Device, textures: u32, buffers: u32) -> Result<Views> {
         let heap = |ty, n: u32, what: &str| -> Result<ID3D12DescriptorHeap> {
             let desc = D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: ty,
@@ -101,7 +108,7 @@ impl Views {
             crate::set_name(&h, what);
             Ok(h)
         };
-        let view_heap = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, textures + 1 + BLOCK * BLOCKS, "mX view heap")?;
+        let view_heap = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, textures + 1 + 2 * buffers + BLOCK * BLOCKS, "mX view heap")?;
         let sampler_heap = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, mx_shader::hlsl::SAMPLER_HEAP_SIZE, "mX sampler heap")?;
         // SAFETY: plain getters on live objects.
         unsafe {
@@ -115,6 +122,7 @@ impl Views {
                 view_heap,
                 sampler_heap,
                 textures,
+                buffers,
             })
         }
     }
@@ -142,9 +150,19 @@ impl Views {
         self.textures
     }
 
+    /// The raw SRV of buffer slot `slot`.
+    pub fn buffer_srv(&self, slot: u32) -> u32 {
+        self.textures + 1 + slot
+    }
+
+    /// The raw UAV of buffer slot `slot`.
+    pub fn buffer_uav(&self, slot: u32) -> u32 {
+        self.textures + 1 + self.buffers + slot
+    }
+
     /// The first descriptor of root-table block `b`.
     pub fn block_start(&self, b: u32) -> u32 {
-        self.textures + 1 + b * BLOCK
+        self.textures + 1 + 2 * self.buffers + b * BLOCK
     }
 }
 
@@ -152,19 +170,74 @@ impl Views {
 pub(crate) struct Heap {
     textures: Slots,
     samplers: Slots,
+    buffers: Slots,
     /// Textures whose heap view was released but which a submission may still read.
     retired: Vec<(u64, Texture)>,
+    /// Buffers likewise.
+    retired_buffers: Vec<(u64, Buffer)>,
+    /// The buffers with views in the heap (by resource), with how many views and how many
+    /// writable ones: a command list keeps them in the state shaders reach them in (see
+    /// `Heap::buffer_states`).
+    heap_buffers: HashMap<usize, (Track, u32, u32)>,
+    /// Bumped whenever `heap_buffers` changes.
+    pub buffer_generation: u64,
     free_blocks: Vec<u32>,
 }
 
 impl Heap {
-    pub fn new(textures: u32, samplers: u32) -> Heap {
+    pub fn new(textures: u32, samplers: u32, buffers: u32) -> Heap {
         Heap {
             textures: Slots::new(textures),
             samplers: Slots::new(samplers),
+            buffers: Slots::new(buffers),
             retired: Vec::new(),
+            retired_buffers: Vec::new(),
+            heap_buffers: HashMap::new(),
+            buffer_generation: 1,
             free_blocks: (0..BLOCKS).rev().collect(),
         }
+    }
+
+    /// A slot for a view of `buffer`. `writable`: shaders may write it through the heap.
+    pub fn alloc_buffer(&mut self, buffer: &Buffer, writable: bool) -> Result<u32> {
+        let slot = self.buffers.alloc("buffers")?;
+        let e = self.heap_buffers.entry(buffer.key()).or_insert_with(|| (buffer.0.track.clone(), 0, 0));
+        e.1 += 1;
+        e.2 += writable as u32;
+        self.buffer_generation += 1;
+        Ok(slot)
+    }
+
+    /// Release a buffer slot (reused after submission `after` is done) and keep the buffer
+    /// alive until then.
+    pub fn release_buffer(&mut self, slot: u32, after: u64, buffer: Buffer, writable: bool) {
+        self.buffers.release(slot, after);
+        if let Some(e) = self.heap_buffers.get_mut(&buffer.key()) {
+            e.1 -= 1;
+            e.2 -= writable as u32;
+            if e.1 == 0 {
+                self.heap_buffers.remove(&buffer.key());
+            }
+        }
+        self.buffer_generation += 1;
+        self.retired_buffers.push((after, buffer));
+    }
+
+    /// The state each buffer with heap views is in while shaders may reach it through the
+    /// heap: `UNORDERED_ACCESS` with a writable view, else readable by every shader stage.
+    pub fn buffer_states(&self) -> impl Iterator<Item = (&Track, D3D12_RESOURCE_STATES)> {
+        self.heap_buffers.values().map(|(track, _, writable)| {
+            let state = if *writable > 0 {
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            } else {
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            };
+            (track, state)
+        })
+    }
+
+    pub fn buffers_in_use(&self) -> usize {
+        self.buffers.in_use
     }
 
     pub fn alloc_texture(&mut self) -> Result<u32> {
@@ -196,10 +269,12 @@ impl Heap {
     }
 
     /// Everything released before submission `completed` finished is free again. Returns the
-    /// textures to drop outside the lock.
+    /// textures to drop outside the lock (buffers are dropped here: dropping one takes no lock).
     pub fn reclaim(&mut self, completed: u64) -> Vec<Texture> {
         self.textures.reclaim(completed);
         self.samplers.reclaim(completed);
+        self.buffers.reclaim(completed);
+        self.retired_buffers.retain(|(after, _)| *after > completed);
         let mut done = Vec::new();
         self.retired.retain_mut(|(after, t)| {
             if *after <= completed {

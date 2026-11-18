@@ -32,10 +32,16 @@ impl Instance {
                 devices.push(d);
             }
         }
-        devices.into_iter().filter(|d| d.supportsFamily(MTLGPUFamily::Metal3)).map(|d| Adapter { raw: Mt(d) }).collect()
+        // (Metal 3 first; Metal 2 GPUs after them, on the bound tier, unless MX_METAL2=0)
+        let metal2 = std::env::var_os("MX_METAL2").is_none_or(|v| v != "0");
+        let (mut three, two): (Vec<_>, Vec<_>) = devices.into_iter().partition(|d| d.supportsFamily(MTLGPUFamily::Metal3));
+        if metal2 {
+            three.extend(two.into_iter().filter(|d| d.supportsFamily(MTLGPUFamily::Mac2) || d.supportsFamily(MTLGPUFamily::Apple4)));
+        }
+        three.into_iter().map(|d| Adapter { raw: Mt(d) }).collect()
     }
 
-    /// The system's default Metal 3 device.
+    /// The system's default Metal device (Metal 3 where there is one).
     pub fn default_adapter(&self) -> Result<Adapter> {
         self.enumerate_adapters().into_iter().next().ok_or(Error::NoDevice)
     }
@@ -47,6 +53,13 @@ pub struct Adapter {
 }
 
 impl Adapter {
+    /// A Metal 2 GPU: mX runs it on the bound tier (heap accesses indexed by immediates or
+    /// constants only; no GPU-driven batches, no ray queries). `MX_METAL_BOUND=1` runs a Metal 3
+    /// GPU so too, to test the tier.
+    pub fn is_bound_tier(&self) -> bool {
+        !self.raw.supportsFamily(MTLGPUFamily::Metal3) || std::env::var_os("MX_METAL_BOUND").is_some_and(|v| v == "1")
+    }
+
     pub fn info(&self) -> t::AdapterInfo {
         let d = &self.raw;
         let device_type = if d.hasUnifiedMemory() || d.isLowPower() {
@@ -71,13 +84,56 @@ impl Adapter {
             max_texture_dimension_2d: 16384,
             max_texture_dimension_3d: 2048,
             max_texture_array_layers: 2048,
-            max_bindless_textures: if d.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2 { 500_000 } else { 0 },
+            // (the bound tier keeps the heap on the CPU: any size)
+            max_bindless_textures: if self.is_bound_tier() || d.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2 {
+                500_000
+            } else {
+                0
+            },
             max_bindless_samplers: 2048,
+            max_bindless_buffers: if self.is_bound_tier() || d.argumentBuffersSupport() == MTLArgumentBuffersTier::Tier2 {
+                500_000
+            } else {
+                0
+            },
+            // (a GPU address needs only 4-byte alignment; 256 keeps every backend's rule)
+            buffer_view_offset_alignment: 256,
             max_immediate_size: 4096,
             max_vertex_buffers: mx_shader::msl::MAX_VERTEX_BUFFERS,
             max_root_buffers: mx_shader::msl::MAX_ROOT_BUFFERS,
             max_color_attachments: 8,
+            max_buffer_size: d.maxBufferLength() as u64,
+            max_storage_buffer_binding_size: d.maxBufferLength() as u64,
+            min_uniform_buffer_offset_alignment: 256,
+            min_storage_buffer_offset_alignment: 256,
         }
+    }
+
+    /// The GPU's memory: the working set the system recommends (on Apple silicon, the share of
+    /// unified memory the GPU may use).
+    pub fn memory_info(&self) -> Option<t::AdapterMemory> {
+        let set = self.raw.recommendedMaxWorkingSetSize();
+        Some(t::AdapterMemory {
+            dedicated_bytes: set,
+            budget_bytes: Some(set),
+        })
+    }
+
+    /// Whether `format` renders and resolves with `samples` samples per pixel.
+    pub fn supports_msaa(&self, format: t::TextureFormat, samples: u32) -> bool {
+        let _ = format;
+        samples <= 1 || self.raw.supportsTextureSampleCount(samples as usize)
+    }
+
+    /// Textures a pipeline may read through root bindings (on OpenGL, through anything: texture
+    /// units): (vertex stage, fragment stage, the pipeline together).
+    pub fn texture_units(&self) -> (u32, u32, u32) {
+        (mx_shader::msl::MAX_ROOT_TEXTURES, mx_shader::msl::MAX_ROOT_TEXTURES, 2 * mx_shader::msl::MAX_ROOT_TEXTURES)
+    }
+
+    /// Indexed draws with a base vertex (not below OpenGL 3.2 / ES 3.2).
+    pub fn supports_base_vertex(&self) -> bool {
+        true
     }
 
     pub fn supports_bc(&self) -> bool {
@@ -85,7 +141,24 @@ impl Adapter {
     }
 
     pub fn supports_ray_query(&self) -> bool {
-        self.raw.supportsRaytracing()
+        !self.is_bound_tier() && self.raw.supportsRaytracing()
+    }
+
+    /// Compute shaders: every bindless device has them.
+    pub fn supports_compute(&self) -> bool {
+        true
+    }
+
+    /// How many storage buffers the vertex and fragment stages may read as root bindings
+    /// (any number through the heap).
+    pub fn storage_buffers_per_stage(&self) -> (u32, u32) {
+        (31, 31)
+    }
+
+    /// GPU-driven draw counts (`Device::create_indirect_draws`): indirect command buffers,
+    /// on every Metal 3 device (their kernels read the heap through argument buffers).
+    pub fn supports_indirect_count(&self) -> bool {
+        !self.is_bound_tier()
     }
 
     pub fn supports_timestamps(&self) -> bool {
@@ -96,6 +169,7 @@ impl Adapter {
         let limits = self.limits();
         let textures = desc.bindless_textures.min(limits.max_bindless_textures);
         let samplers = desc.bindless_samplers.min(limits.max_bindless_samplers);
+        let buffers = desc.bindless_buffers.min(limits.max_bindless_buffers).max(1);
         if textures == 0 {
             return Err(Error::Unsupported("Tier 2 argument buffers (bindless)".into()));
         }
@@ -103,7 +177,7 @@ impl Adapter {
         if let Some(l) = desc.label {
             queue.setLabel(Some(&crate::ns(l)));
         }
-        let heap = Heap::new(&self.raw, textures, samplers)?;
+        let heap = Heap::new(&self.raw, textures, samplers, buffers)?;
         if let Some(set) = heap.residency_set() {
             // (the heap's textures stay resident for everything this queue runs)
             queue.addResidencySet(set);
@@ -119,15 +193,22 @@ impl Adapter {
             ring: Mutex::new(Ring::new()),
             fresh: Mutex::new(Vec::new()),
             zeros: Mutex::new(None),
+            indirect: Mutex::new(None),
             info: self.info(),
             limits: t::Limits {
                 max_bindless_textures: textures,
                 max_bindless_samplers: samplers,
+                max_bindless_buffers: buffers,
                 ..limits
-            },
+            }
+            .capped(desc.limits.as_ref()),
             bc: self.supports_bc(),
             timestamp_period: crate::query::measure_timestamp_period(&self.raw),
+            bound: self.is_bound_tier(),
         });
+        if shared.bound {
+            log::info!("mX: {} has no Metal 3; running on the bound tier", shared.info.name);
+        }
         Ok((Device { shared: shared.clone() }, Queue { shared }))
     }
 }
@@ -139,14 +220,21 @@ pub struct DeviceDescriptor<'a> {
     pub bindless_textures: u32,
     /// Samplers the heap holds at once.
     pub bindless_samplers: u32,
+    /// Buffer views the heap holds at once.
+    pub bindless_buffers: u32,
+    /// Limits the device keeps to, where lower than the adapter's (a weaker chip's, to
+    /// test on); None: the adapter's.
+    pub limits: Option<t::Limits>,
 }
 
 impl Default for DeviceDescriptor<'_> {
     fn default() -> Self {
         DeviceDescriptor {
+            limits: None,
             label: None,
             bindless_textures: 1 << 16,
             bindless_samplers: 2048,
+            bindless_buffers: 1 << 15,
         }
     }
 }
@@ -228,6 +316,9 @@ impl Drop for PendingWrites {
 /// Submitted command buffers not yet seen complete, with their submission index.
 type InFlight = VecDeque<(u64, Mt<Po<dyn MTLCommandBuffer>>)>;
 
+/// The kernels that encode GPU-driven draws: (draws, indexed draws).
+pub(crate) type IndirectKernels = [Mt<Po<dyn MTLComputePipelineState>>; 2];
+
 pub(crate) struct Shared {
     pub device: Mt<Po<dyn MTLDevice>>,
     pub queue: Mt<Po<dyn MTLCommandQueue>>,
@@ -241,10 +332,15 @@ pub(crate) struct Shared {
     /// Textures made since the last submission (see `zero_new_textures`).
     pub fresh: Mutex<Vec<std::sync::Weak<crate::resource::TextureInner>>>,
     pub zeros: Mutex<Option<Mt<Po<dyn MTLBuffer>>>>,
+    /// The kernels that encode GPU-driven draws into indirect command buffers: (draws,
+    /// indexed draws), made on first use.
+    pub indirect: Mutex<Option<IndirectKernels>>,
     pub info: t::AdapterInfo,
     pub limits: t::Limits,
     pub bc: bool,
     pub timestamp_period: f32,
+    /// A Metal 2 GPU (no Metal 3): the heap is bound slot by slot at each draw (`bound tier`).
+    pub bound: bool,
 }
 
 impl Shared {
@@ -381,7 +477,12 @@ impl Shared {
                 match cmd.status() {
                     MTLCommandBufferStatus::Completed => {}
                     MTLCommandBufferStatus::Error => {
-                        error = Some(cmd.error().map(|e| e.localizedDescription().to_string()).unwrap_or_else(|| "unknown".into()));
+                        error = Some(match cmd.error() {
+                            // (MTLCommandBufferErrorDeviceRemoved: an eGPU unplugged, a GPU reset)
+                            Some(e) if e.code() == 11 => Error::DeviceLost(e.localizedDescription().to_string()),
+                            Some(e) => Error::Device(e.localizedDescription().to_string()),
+                            None => Error::Device("a command buffer failed".into()),
+                        });
                     }
                     _ => break,
                 }
@@ -392,7 +493,7 @@ impl Shared {
         self.heap.lock().reclaim(self.completed.load(Ordering::Acquire));
         self.ring.lock().reclaim(self.completed.load(Ordering::Acquire));
         match error {
-            Some(e) => Err(Error::Device(e)),
+            Some(e) => Err(e),
             None => Ok(()),
         }
     }
@@ -436,9 +537,24 @@ impl Device {
         self.shared.completed.load(std::sync::atomic::Ordering::Acquire) >= index.0
     }
 
+    /// BC texture compression (as the adapter's `supports_bc`).
+    pub fn supports_bc(&self) -> bool {
+        self.shared.bc
+    }
+
+    /// Timestamp queries (as the adapter's `supports_timestamps`).
+    pub fn supports_timestamps(&self) -> bool {
+        crate::query::timestamp_counter_set(&self.shared.device).is_some()
+    }
+
     /// Texture views in the heap right now.
     pub fn bindless_textures_in_use(&self) -> usize {
         self.shared.heap.lock().textures_in_use()
+    }
+
+    /// Buffer views in the heap right now.
+    pub fn bindless_buffers_in_use(&self) -> usize {
+        self.shared.heap.lock().buffers_in_use()
     }
 
     /// The `MTLDevice`, for interop (MetalFX, capture).

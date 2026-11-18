@@ -1,0 +1,21 @@
+[package]
+name = "mx-gl"
+description = "mX: the OpenGL / OpenGL ES backend of the bound tier (EGL; ANGLE on Windows)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+mx-types.workspace = true
+mx-shader = { workspace = true, features = ["glsl"] }
+glow = "0.17"
+khronos-egl = { version = "6", default-features = false, features = ["1_5", "dynamic"] }
+libloading = "0.8"
+parking_lot.workspace = true
+thiserror.workspace = true
+log.workspace = true
+raw-window-handle = "0.6"

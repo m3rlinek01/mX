@@ -47,8 +47,35 @@ impl Drop for SurfaceRaw {
     }
 }
 
+/// The swapchain functions a surface calls: the driver's, or those of a vendor's frame
+/// generation that made the swapchain (`Surface::set_swapchain_maker`).
+#[derive(Clone, Copy)]
+pub struct SwapchainFns {
+    pub destroy: vk::PFN_vkDestroySwapchainKHR,
+    pub get_images: vk::PFN_vkGetSwapchainImagesKHR,
+    pub acquire: vk::PFN_vkAcquireNextImageKHR,
+    pub present: vk::PFN_vkQueuePresentKHR,
+}
+
+impl SwapchainFns {
+    fn of(f: &ash::khr::swapchain::Device) -> SwapchainFns {
+        let fp = f.fp();
+        SwapchainFns {
+            destroy: fp.destroy_swapchain_khr,
+            get_images: fp.get_swapchain_images_khr,
+            acquire: fp.acquire_next_image_khr,
+            present: fp.queue_present_khr,
+        }
+    }
+}
+
+/// Makes a surface's swapchain in place of `vkCreateSwapchainKHR`, and gives the functions
+/// to use it with.
+pub type SwapchainMaker = Arc<dyn Fn(vk::Device, &vk::SwapchainCreateInfoKHR<'_>) -> std::result::Result<(vk::SwapchainKHR, SwapchainFns), vk::Result> + Send + Sync>;
+
 struct Swapchain {
     raw: vk::SwapchainKHR,
+    fns: SwapchainFns,
     _surface: Arc<SurfaceRaw>,
     shared: Arc<Shared>,
     images: Vec<vk::Image>,
@@ -78,9 +105,7 @@ impl Drop for Swapchain {
             for s in self.acquire.iter().chain(&self.present) {
                 shared.raw.destroy_semaphore(*s, None);
             }
-            if let Some(f) = &shared.fns.swapchain {
-                f.destroy_swapchain(self.raw, None);
-            }
+            (self.fns.destroy)(shared.raw.handle(), self.raw, std::ptr::null());
         }
     }
 }
@@ -96,6 +121,7 @@ struct State {
 pub struct Surface<'w> {
     raw: Arc<SurfaceRaw>,
     state: Mutex<Option<State>>,
+    maker: Mutex<Option<SwapchainMaker>>,
     _window: Option<Box<dyn Window + Send + Sync + 'w>>,
     _lifetime: PhantomData<&'w ()>,
 }
@@ -111,6 +137,7 @@ impl Instance {
         Ok(Surface {
             raw: s.raw.clone(),
             state: Mutex::new(None),
+            maker: Mutex::new(None),
             _window: Some(Box::new(window)),
             _lifetime: PhantomData,
         })
@@ -164,6 +191,7 @@ impl Instance {
                         view: Mt(view),
                     }),
                     state: Mutex::new(None),
+                    maker: Mutex::new(None),
                     _window: None,
                     _lifetime: PhantomData,
                 });
@@ -192,6 +220,7 @@ impl Instance {
                         _layer: Mt(layer),
                     }),
                     state: Mutex::new(None),
+                    maker: Mutex::new(None),
                     _window: None,
                     _lifetime: PhantomData,
                 });
@@ -256,6 +285,7 @@ impl Instance {
             Ok(Surface {
                 raw: Arc::new(SurfaceRaw { raw, instance: inst.clone() }),
                 state: Mutex::new(None),
+                maker: Mutex::new(None),
                 _window: None,
                 _lifetime: PhantomData,
             })
@@ -413,11 +443,23 @@ impl Surface<'_> {
             .old_swapchain(old_raw);
         // SAFETY: a live surface; the old swapchain is retired by this call and destroyed
         // below once idle.
-        let raw = unsafe { f.create_swapchain(&info, None) }.expect("vkCreateSwapchainKHR");
+        let maker = self.maker.lock().clone();
+        let (raw, fns) = match maker {
+            Some(make) => make(shared.raw.handle(), &info).expect("the surface's swapchain maker failed"),
+            None => (unsafe { f.create_swapchain(&info, None) }.expect("vkCreateSwapchainKHR"), SwapchainFns::of(f)),
+        };
         drop(old);
         // SAFETY: plain queries and creations.
         let (images, acquire, present) = unsafe {
-            let images = f.get_swapchain_images(raw).expect("vkGetSwapchainImagesKHR");
+            let images = {
+                let dev = shared.raw.handle();
+                let mut n = 0;
+                (fns.get_images)(dev, raw, &mut n, std::ptr::null_mut()).result().expect("vkGetSwapchainImagesKHR");
+                let mut images = vec![vk::Image::null(); n as usize];
+                (fns.get_images)(dev, raw, &mut n, images.as_mut_ptr()).result().expect("vkGetSwapchainImagesKHR");
+                images.truncate(n as usize);
+                images
+            };
             let sem = || shared.raw.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).expect("vkCreateSemaphore");
             let acquire: Vec<vk::Semaphore> = (0..images.len() + 1).map(|_| sem()).collect();
             let present: Vec<vk::Semaphore> = images.iter().map(|_| sem()).collect();
@@ -428,6 +470,7 @@ impl Surface<'_> {
             _device: device.clone(),
             swapchain: Some(Arc::new(Swapchain {
                 raw,
+                fns,
                 _surface: self.raw.clone(),
                 shared: shared.clone(),
                 images,
@@ -482,13 +525,15 @@ impl Surface<'_> {
             return t::CurrentSurfaceTexture::Lost;
         }
         let sem = sc.acquire[slot];
-        let f = shared.fns.swapchain.as_ref().expect("swapchain functions");
         // SAFETY: the semaphore is unsignalled with no pending wait (its last waiter is done).
-        let (index, suboptimal) = match unsafe { f.acquire_next_image(sc.raw, 1_000_000_000, sem, vk::Fence::null()) } {
-            Ok(r) => r,
-            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => return t::CurrentSurfaceTexture::Timeout,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return t::CurrentSurfaceTexture::Outdated,
-            Err(e) => {
+        let mut index = 0;
+        let acquired = unsafe { (sc.fns.acquire)(shared.raw.handle(), sc.raw, 1_000_000_000, sem, vk::Fence::null(), &mut index) };
+        let suboptimal = acquired == vk::Result::SUBOPTIMAL_KHR;
+        match acquired {
+            vk::Result::SUCCESS | vk::Result::SUBOPTIMAL_KHR => {}
+            vk::Result::TIMEOUT | vk::Result::NOT_READY => return t::CurrentSurfaceTexture::Timeout,
+            vk::Result::ERROR_OUT_OF_DATE_KHR => return t::CurrentSurfaceTexture::Outdated,
+            e => {
                 log::error!("mX: vkAcquireNextImageKHR: {e}");
                 return t::CurrentSurfaceTexture::Lost;
             }
@@ -520,6 +565,26 @@ impl Surface<'_> {
         } else {
             t::CurrentSurfaceTexture::Success(st)
         }
+    }
+
+    /// Have `maker` make the swapchain from the next `configure` on (None: the driver's own
+    /// again). The current swapchain is let go of: configure the surface again before the next
+    /// frame.
+    pub fn set_swapchain_maker(&self, maker: Option<SwapchainMaker>) {
+        *self.maker.lock() = maker;
+        if let Some(state) = self.state.lock().as_mut() {
+            state.swapchain = None;
+        }
+    }
+
+    /// The configuration of the current swapchain.
+    pub fn config(&self) -> Option<t::SurfaceConfiguration> {
+        self.state.lock().as_ref().and_then(|s| s.swapchain.as_ref()).map(|s| s.config.clone())
+    }
+
+    /// The current `VkSwapchainKHR`, for interop.
+    pub fn raw_swapchain(&self) -> Option<vk::SwapchainKHR> {
+        self.state.lock().as_ref().and_then(|s| s.swapchain.as_ref()).map(|s| s.raw)
     }
 
     /// The `VkSurfaceKHR`, for interop.
@@ -559,13 +624,12 @@ impl SurfaceTexture {
         let swapchains = [sc.raw];
         let indices = [self.index];
         let info = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&swapchains).image_indices(&indices);
-        let f = shared.fns.swapchain.as_ref().expect("swapchain functions");
         let q = shared.queue.lock();
         // SAFETY: the image was acquired and is in PRESENT_SRC once the semaphore signals.
-        match unsafe { f.queue_present(*q, &info) } {
-            Ok(false) => {}
-            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => sc.outdated.store(true, Ordering::Release),
-            Err(e) => log::error!("mX: vkQueuePresentKHR: {e}"),
+        match unsafe { (sc.fns.present)(*q, &info) } {
+            vk::Result::SUCCESS => {}
+            vk::Result::SUBOPTIMAL_KHR | vk::Result::ERROR_OUT_OF_DATE_KHR => sc.outdated.store(true, Ordering::Release),
+            e => log::error!("mX: vkQueuePresentKHR: {e}"),
         }
         drop(q);
         sc.presented.lock().push_back(submitted.0);

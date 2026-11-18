@@ -306,7 +306,7 @@ impl CommandEncoder {
     pub fn build_acceleration_structures<'a>(&mut self, blas: impl IntoIterator<Item = &'a t::BlasBuildEntry<'a, Blas, Buffer>>, tlas: impl IntoIterator<Item = &'a Tlas>) {
         let shared = self.shared.clone();
         let f = shared.fns.accel.as_ref().expect("ray queries are not supported on this device");
-        self.before();
+        self.before(crate::command::Op::ANY);
         for entry in blas {
             let b = &entry.blas.0;
             assert_eq!(entry.geometry.len(), b.sizes.len(), "a BLAS build needs one geometry per size it was created with");
@@ -392,6 +392,6 @@ impl CommandEncoder {
             *t.last_count.lock() = Some(count);
             *t.inner.built_with.lock() = Arc::new(blases);
         }
-        self.mark_dirty();
+        self.after(crate::command::Op::ANY);
     }
 }
