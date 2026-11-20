@@ -2045,3 +2045,23 @@ fn gpu_driven_draws_stop_at_the_gpus_count() {
         assert_eq!([quarter(0), quarter(1), quarter(2), quarter(3)], [255, 255, 255, 0], "indexed: {indexed}");
     }
 }
+
+/// `Surface::is_supported_by` gives an answer: on every backend but Vulkan it asked for the
+/// surface's capabilities while still holding the surface's lock, which `get_capabilities`
+/// takes again, and the thread waited for itself (openOMSI hung at start on Direct3D 12).
+/// The noop backend takes any window handle, so no window is needed.
+#[test]
+fn a_surface_answers_whether_an_adapter_can_present_to_it() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let instance = Instance::with_backends(Backends::NOOP);
+        let adapter = instance.enumerate_adapters().into_iter().next().expect("the noop adapter");
+        let window = raw_window_handle::Win32WindowHandle::new(std::num::NonZeroIsize::new(1).unwrap());
+        let display = raw_window_handle::WindowsDisplayHandle::new();
+        // SAFETY: the noop backend keeps nothing of the handles.
+        let surface = unsafe { instance.create_surface_unsafe(display.into(), window.into()) }.expect("a noop surface");
+        let _ = tx.send(surface.is_supported_by(&adapter));
+    });
+    let supported = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("is_supported_by did not return");
+    assert!(supported, "the noop adapter can present to a noop surface");
+}

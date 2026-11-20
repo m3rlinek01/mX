@@ -1323,12 +1323,15 @@ impl Surface<'_> {
     /// graphics card may not reach the window's screen); elsewhere any adapter of the
     /// surface's backend can, and one of another backend cannot.
     pub fn is_supported_by(&self, adapter: &Adapter) -> bool {
-        let Ok(raw) = self.raw_for(adapter.backend()) else { return false };
-        match (&*raw, adapter) {
+        {
+            let Ok(raw) = self.raw_for(adapter.backend()) else { return false };
             #[cfg(feature = "vulkan")]
-            (SurfaceRaw::Vulkan(s), Adapter::Vulkan(a)) => s.is_supported_by(a),
-            _ => !self.get_capabilities(adapter).formats.is_empty(),
+            if let (SurfaceRaw::Vulkan(s), Adapter::Vulkan(a)) = (&*raw, adapter) {
+                return s.is_supported_by(a);
+            }
         }
+        // (with the surface's lock let go: `get_capabilities` takes it again)
+        !self.get_capabilities(adapter).formats.is_empty()
     }
 
     pub fn get_capabilities(&self, adapter: &Adapter) -> t::SurfaceCapabilities {
