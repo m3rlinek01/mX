@@ -853,8 +853,12 @@ fn flush_constants(r: &impl Roots, layout: &Layout, state: &mut PassState, speci
     if state.immediates_dirty
         && let Some((param, dwords)) = layout.immediates
     {
-        let words: Vec<u32> = state.immediates[..dwords as usize * 4].as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
-        r.constants(param, &words);
+        // (on the stack: the material's places change at nearly every draw)
+        let mut words = [0u32; MAX_IMMEDIATES / 4];
+        for (w, c) in words.iter_mut().zip(state.immediates[..dwords as usize * 4].as_chunks::<4>().0) {
+            *w = u32::from_le_bytes(*c);
+        }
+        r.constants(param, &words[..dwords as usize]);
         state.immediates_dirty = false;
     }
     if state.special != Some(special) {
