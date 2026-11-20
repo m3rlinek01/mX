@@ -66,6 +66,17 @@ fn read_only(s: D3D12_RESOURCE_STATES) -> bool {
     s.0 != 0 && s.0 & !READ_ONLY == 0
 }
 
+/// Whether the resource reaches `state` without a barrier: a buffer in `COMMON` is promoted to
+/// a read state on first use (and decays back when the list is done); with enhanced barriers a
+/// buffer has no layout, and its first access in a list waits for nothing. Every command list
+/// starts with each buffer at home (`COMMON`), so a barrier here came between two draws for
+/// each vertex, index and uniform buffer first drawn from in the list: about 500 a frame in
+/// openOMSI, each one holding the GPU up. Changes from the promoted state (another read state,
+/// a write) are barriers, as before.
+fn implicit(is_texture: bool, cur: D3D12_RESOURCE_STATES, state: D3D12_RESOURCE_STATES) -> bool {
+    !is_texture && cur == D3D12_RESOURCE_STATE_COMMON && read_only(state)
+}
+
 #[derive(Default)]
 pub(crate) struct Tracker {
     entries: HashMap<usize, Entry>,
@@ -120,6 +131,11 @@ impl Tracker {
         let mut changes: Vec<(u32, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)> = Vec::new();
         for s in subs {
             let cur = e.states[s as usize];
+            // (not a move `buffers_moved` waits for: a buffer only reaches a read state here)
+            if implicit(t.is_texture, cur, state) {
+                e.states[s as usize] = state;
+                continue;
+            }
             let next = if cur == state || (read_only(cur) && read_only(state) && cur.0 & state.0 == state.0) {
                 continue;
             } else if read_only(cur) && read_only(state) {
@@ -440,4 +456,29 @@ fn enhanced(state: D3D12_RESOURCE_STATES) -> (D3D12_BARRIER_SYNC, D3D12_BARRIER_
         _ => D3D12_BARRIER_LAYOUT_GENERIC_READ,
     };
     (D3D12_BARRIER_SYNC(sync), D3D12_BARRIER_ACCESS(access), layout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_buffer_in_common_is_promoted_to_read_states_without_a_barrier() {
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        for read in [
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+            D3D12_RESOURCE_STATE_INDEX_BUFFER,
+            crate::conv::SHADER_READ,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        ] {
+            assert!(implicit(false, common, read), "{read:?}");
+            // (textures are not promoted: they rest in their own home states)
+            assert!(!implicit(true, common, read), "{read:?}");
+        }
+        // writes, and anything from a state the buffer was already moved to, take a barrier
+        assert!(!implicit(false, common, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+        assert!(!implicit(false, common, D3D12_RESOURCE_STATE_COPY_DEST));
+        assert!(!implicit(false, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, crate::conv::SHADER_READ));
+    }
 }
