@@ -12,6 +12,7 @@
 //! stages. Otherwise as legacy `ResourceBarrier` transitions.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::ManuallyDrop;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -51,6 +52,31 @@ pub(crate) struct Range {
 struct Entry {
     track: Track,
     states: Vec<D3D12_RESOURCE_STATES>,
+    /// A texture the current operation uses (listed in [`Tracker::scope`]).
+    in_scope: bool,
+}
+
+/// The hash of a resource's address (the tracker's keys): asked for at every draw, where the
+/// standard hasher was a large part of recording one.
+#[derive(Default)]
+struct AddressHasher(u64);
+
+impl Hasher for AddressHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        // (addresses are aligned: their low bits, which pick the bucket, are mixed in from above)
+        let x = (n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = x ^ (x >> 29);
+    }
 }
 
 const READ_ONLY: i32 = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0
@@ -79,7 +105,9 @@ fn implicit(is_texture: bool, cur: D3D12_RESOURCE_STATES, state: D3D12_RESOURCE_
 
 #[derive(Default)]
 pub(crate) struct Tracker {
-    entries: HashMap<usize, Entry>,
+    entries: HashMap<usize, Entry, BuildHasherDefault<AddressHasher>>,
+    /// The state changes of one [`Tracker::need`] (kept: most draws change nothing).
+    changes: Vec<(u32, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)>,
     barriers: Vec<D3D12_RESOURCE_BARRIER>,
     /// Record enhanced barriers instead (see the module's documentation).
     enhanced: bool,
@@ -110,34 +138,24 @@ impl Tracker {
         let e = self.entries.entry(k).or_insert_with(|| Entry {
             states: vec![t.home; t.subresources() as usize],
             track: t.clone(),
+            in_scope: false,
         });
-        if t.is_texture && !self.scope.contains(&k) {
+        if t.is_texture && !e.in_scope {
+            e.in_scope = true;
             self.scope.push(k);
         }
-        let subs: Vec<u32> = match range {
-            None => (0..t.subresources()).collect(),
-            Some(r) => {
-                let mut v = Vec::new();
-                for p in r.planes.clone() {
-                    for l in r.layers.clone() {
-                        for m in r.mips.clone() {
-                            v.push(t.subresource(m, l, p));
-                        }
-                    }
-                }
-                v
-            }
-        };
-        let mut changes: Vec<(u32, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)> = Vec::new();
-        for s in subs {
+        // (no allocation: the subresources are walked in place, the changes go to a kept list)
+        let mut changes = std::mem::take(&mut self.changes);
+        changes.clear();
+        let mut step = |s: u32| {
             let cur = e.states[s as usize];
             // (not a move `buffers_moved` waits for: a buffer only reaches a read state here)
             if implicit(t.is_texture, cur, state) {
                 e.states[s as usize] = state;
-                continue;
+                return;
             }
             let next = if cur == state || (read_only(cur) && read_only(state) && cur.0 & state.0 == state.0) {
-                continue;
+                return;
             } else if read_only(cur) && read_only(state) {
                 D3D12_RESOURCE_STATES(cur.0 | state.0)
             } else {
@@ -145,15 +163,27 @@ impl Tracker {
             };
             changes.push((s, cur, next));
             e.states[s as usize] = next;
+        };
+        match range {
+            None => (0..t.subresources()).for_each(&mut step),
+            Some(r) => {
+                for p in r.planes {
+                    for l in r.layers.clone() {
+                        for m in r.mips.clone() {
+                            step(t.subresource(m, l, p));
+                        }
+                    }
+                }
+            }
         }
-        if !t.is_texture && !changes.is_empty() {
-            self.buffers_moved = true;
+        if !changes.is_empty() {
+            if !t.is_texture {
+                self.buffers_moved = true;
+            }
+            let (raw, is_texture, total) = (e.track.raw.clone(), e.track.is_texture, e.states.len() as u32);
+            self.push(&raw, is_texture, total, &changes);
         }
-        if changes.is_empty() {
-            return;
-        }
-        let (raw, is_texture, total) = (e.track.raw.clone(), e.track.is_texture, e.states.len() as u32);
-        self.push(&raw, is_texture, total, &changes);
+        self.changes = changes;
     }
 
     fn push(&mut self, raw: &ID3D12Resource, is_texture: bool, total: u32, changes: &[(u32, D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)]) {
@@ -219,26 +249,32 @@ impl Tracker {
 
     /// Put every texture back in its home state (the end of a pass or copy).
     pub fn restore_textures(&mut self) {
-        self.scope.clear();
+        self.clear_scope();
         self.restore(|e| e.track.is_texture);
+    }
+
+    fn clear_scope(&mut self) {
+        for k in self.scope.drain(..) {
+            if let Some(e) = self.entries.get_mut(&k) {
+                e.in_scope = false;
+            }
+        }
     }
 
     /// Start of an operation (a draw's or dispatch's bindings): textures it does not ask for
     /// with [`Tracker::need`] before [`Tracker::end_scope`] go back home then.
     pub fn begin_scope(&mut self) {
-        self.scope.clear();
+        self.clear_scope();
     }
 
     /// Return textures the operation did not use to their home state.
     pub fn end_scope(&mut self) {
-        let scope = std::mem::take(&mut self.scope);
-        self.restore(|e| e.track.is_texture && !scope.contains(&key(&e.track.raw)));
-        self.scope = scope;
+        self.restore(|e| e.track.is_texture && !e.in_scope);
     }
 
     /// Everything back home (the end of a command list).
     pub fn restore_all(&mut self) {
-        self.scope.clear();
+        self.clear_scope();
         self.restore(|_| true);
     }
 
