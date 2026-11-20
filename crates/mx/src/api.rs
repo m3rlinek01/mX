@@ -1325,6 +1325,9 @@ impl Surface<'_> {
     pub fn is_supported_by(&self, adapter: &Adapter) -> bool {
         {
             let Ok(raw) = self.raw_for(adapter.backend()) else { return false };
+            // (without Vulkan the lock is only taken to see that the backend has a surface)
+            #[cfg(not(feature = "vulkan"))]
+            drop(raw);
             #[cfg(feature = "vulkan")]
             if let (SurfaceRaw::Vulkan(s), Adapter::Vulkan(a)) = (&*raw, adapter) {
                 return s.is_supported_by(a);
